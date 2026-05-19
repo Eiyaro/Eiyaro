@@ -355,7 +355,7 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 
 ## Acknowledgments
 
-Eiyaro is built upon the HTND architecture. Thanks to the original team for their open-source contributions.
+Eiyaro is built upon the KAS architecture. Thanks to the original team for their open-source contributions.
 
 ---
 
