@@ -1,0 +1,34 @@
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/Eiyaro/Eiyaro/stability-tests/common"
+	"github.com/Eiyaro/Eiyaro/util/profiling"
+)
+
+func main() {
+	err := parseConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing config: %+v", err)
+		os.Exit(1)
+	}
+	// backendLog.Close() is called explicitly before os.Exit(1) in all error paths.
+	common.UseLogger(backendLog, log.Level())
+	cfg := activeConfig()
+	if cfg.Profile != "" {
+		profiling.Start(cfg.Profile, log)
+	}
+
+	messagesChan := common.ScanHexFile(cfg.MessagesFilePath)
+
+	err = sendMessages(cfg.NodeP2PAddress, messagesChan)
+	if err != nil {
+		log.Errorf("Error sending messages: %+v", err)
+		if backendLog != nil {
+			backendLog.Close()
+		}
+		os.Exit(1)
+	}
+}

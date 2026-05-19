@@ -1,0 +1,232 @@
+package rpcstats
+
+import (
+	"net"
+	"net/netip"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/infrastructure/logger"
+	"github.com/Eiyaro/Eiyaro/util/panics"
+)
+
+var (
+	log   = logger.RegisterSubSystem("RPCSTATS")
+	spawn = panics.GoroutineWrapperFunc(log)
+)
+
+const (
+	// statsLoggingInterval is how often we log the RPC statistics
+	statsLoggingInterval = 1 * time.Minute
+)
+
+// Stats tracks RPC request statistics
+type Stats struct {
+	sync.RWMutex
+	requestsByIP     map[string]uint64
+	requestsByMethod map[string]uint64
+	totalRequests    uint64
+	startTime        time.Time
+	stopChan         chan struct{}
+	running          bool
+}
+
+// IPRequestCount represents a request count for a specific IP
+type IPRequestCount struct {
+	IP    string
+	Count uint64
+}
+
+// MethodRequestCount represents a request count for a specific RPC method
+type MethodRequestCount struct {
+	Method string
+	Count  uint64
+}
+
+// NewStats creates a new RPC statistics tracker
+func NewStats() *Stats {
+	return &Stats{
+		requestsByIP:     make(map[string]uint64),
+		requestsByMethod: make(map[string]uint64),
+		totalRequests:    0,
+		startTime:        time.Now(),
+		stopChan:         make(chan struct{}),
+	}
+}
+
+// Start begins the periodic logging of RPC statistics
+func (s *Stats) Start() {
+	s.Lock()
+	if s.running {
+		s.Unlock()
+		return
+	}
+	s.stopChan = make(chan struct{})
+	s.running = true
+	stopChan := s.stopChan
+	s.Unlock()
+
+	spawn("rpcstats-logging", func() {
+		ticker := time.NewTicker(statsLoggingInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				s.logAndReset()
+			case <-stopChan:
+				return
+			}
+		}
+	})
+	log.Infof("RPC statistics tracking started (logging every %v)", statsLoggingInterval)
+}
+
+// Stop stops the statistics tracker
+func (s *Stats) Stop() {
+	s.Lock()
+	if !s.running {
+		s.Unlock()
+		return
+	}
+	close(s.stopChan)
+	s.stopChan = nil
+	s.running = false
+	s.Unlock()
+
+	log.Infof("RPC statistics tracking stopped")
+}
+
+// RecordRequest records an RPC request from a given IP address
+func (s *Stats) RecordRequest(address string, method string) {
+	// Extract IP from address (which may include port)
+	ip := extractIP(address)
+
+	s.Lock()
+	defer s.Unlock()
+
+	s.requestsByIP[ip]++
+	s.requestsByMethod[method]++
+	s.totalRequests++
+}
+
+// extractIP extracts just the IP address from an address that may include a port
+func extractIP(address string) string {
+	if address == "" {
+		return "unknown"
+	}
+
+	if addrPort, err := netip.ParseAddrPort(address); err == nil {
+		return normalizeIP(addrPort.Addr())
+	}
+
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		if addr, parseErr := netip.ParseAddr(address); parseErr == nil {
+			return normalizeIP(addr)
+		}
+
+		// If there's no port and it's not a raw IP, return the address as-is
+		return address
+	}
+
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return normalizeIP(addr)
+	}
+
+	return host
+}
+
+func normalizeIP(addr netip.Addr) string {
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	return addr.String()
+}
+
+// logAndReset logs the current statistics and resets the counters
+func (s *Stats) logAndReset() {
+	s.Lock()
+	defer s.Unlock()
+
+	elapsed := time.Since(s.startTime)
+
+	if s.totalRequests == 0 {
+		log.Debugf("RPC Stats: No requests in the last %v", elapsed.Round(time.Second))
+		s.startTime = time.Now()
+		return
+	}
+
+	// Calculate requests per minute
+	minutes := elapsed.Minutes()
+	if minutes < 0.01 {
+		minutes = 0.01 // Avoid division by zero
+	}
+	requestsPerMinute := float64(s.totalRequests) / minutes
+
+	log.Infof("RPC Stats: %d total requests in %v (%.1f req/min)",
+		s.totalRequests, elapsed.Round(time.Second), requestsPerMinute)
+
+	// Log top IPs by request count
+	topIPs := s.getTopIPs(10)
+	if len(topIPs) > 0 {
+		log.Infof("RPC Stats: Top requesting IPs:")
+		for i, ipCount := range topIPs {
+			percentage := float64(ipCount.Count) / float64(s.totalRequests) * 100
+			log.Infof("  %d. %s: %d requests (%.1f%%)", i+1, ipCount.IP, ipCount.Count, percentage)
+		}
+	}
+
+	topMethods := s.getTopMethods(10)
+	if len(topMethods) > 0 {
+		log.Infof("RPC Stats: Top requested methods:")
+		for i, methodCount := range topMethods {
+			percentage := float64(methodCount.Count) / float64(s.totalRequests) * 100
+			log.Infof("  %d. %s: %d requests (%.1f%%)", i+1, methodCount.Method, methodCount.Count, percentage)
+		}
+	}
+
+	// Reset counters
+	s.requestsByIP = make(map[string]uint64)
+	s.requestsByMethod = make(map[string]uint64)
+	s.totalRequests = 0
+	s.startTime = time.Now()
+}
+
+// getTopIPs returns the top N IPs by request count
+func (s *Stats) getTopIPs(n int) []IPRequestCount {
+	ipCounts := make([]IPRequestCount, 0, len(s.requestsByIP))
+	for ip, count := range s.requestsByIP {
+		ipCounts = append(ipCounts, IPRequestCount{IP: ip, Count: count})
+	}
+
+	// Sort by count descending
+	sort.Slice(ipCounts, func(i, j int) bool {
+		return ipCounts[i].Count > ipCounts[j].Count
+	})
+
+	if len(ipCounts) > n {
+		ipCounts = ipCounts[:n]
+	}
+
+	return ipCounts
+}
+
+// getTopMethods returns the top N RPC methods by request count
+func (s *Stats) getTopMethods(n int) []MethodRequestCount {
+	methodCounts := make([]MethodRequestCount, 0, len(s.requestsByMethod))
+	for method, count := range s.requestsByMethod {
+		methodCounts = append(methodCounts, MethodRequestCount{Method: method, Count: count})
+	}
+
+	sort.Slice(methodCounts, func(i, j int) bool {
+		return methodCounts[i].Count > methodCounts[j].Count
+	})
+
+	if len(methodCounts) > n {
+		methodCounts = methodCounts[:n]
+	}
+
+	return methodCounts
+}

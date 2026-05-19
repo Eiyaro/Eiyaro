@@ -1,0 +1,40 @@
+package serialization
+
+import (
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/utxo"
+	"github.com/Eiyaro/Eiyaro/util/memory"
+)
+
+// UTXODiffToDBUTXODiff converts UTXODiff to DbUtxoDiff
+func UTXODiffToDBUTXODiff(diff externalapi.UTXODiff, toAddBuffer *memory.Block[*DbUtxoCollectionItem], toRemoveBuffer *memory.Block[*DbUtxoCollectionItem]) (*DbUtxoDiff, *memory.Block[*DbUtxoCollectionItem], *memory.Block[*DbUtxoCollectionItem], error) {
+	toAdd, toAddBuffer, err := utxoCollectionToDBUTXOCollection(diff.ToAdd(), toAddBuffer)
+	if err != nil {
+		return nil, toAddBuffer, toRemoveBuffer, err
+	}
+
+	toRemove, toRemoveBuffer, err := utxoCollectionToDBUTXOCollection(diff.ToRemove(), toRemoveBuffer)
+	if err != nil {
+		return nil, toAddBuffer, toRemoveBuffer, err
+	}
+
+	return &DbUtxoDiff{
+		ToAdd:    toAdd,
+		ToRemove: toRemove,
+	}, toAddBuffer, toRemoveBuffer, nil
+}
+
+// DBUTXODiffToUTXODiff converts DbUtxoDiff to UTXODiff
+func DBUTXODiffToUTXODiff(diff *DbUtxoDiff) (externalapi.UTXODiff, error) {
+	toAdd, err := dbUTXOCollectionToUTXOCollection(diff.ToAdd)
+	if err != nil {
+		return nil, err
+	}
+
+	toRemove, err := dbUTXOCollectionToUTXOCollection(diff.ToRemove)
+	if err != nil {
+		return nil, err
+	}
+
+	return utxo.NewUTXODiffFromCollections(toAdd, toRemove)
+}

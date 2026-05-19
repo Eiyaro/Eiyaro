@@ -1,0 +1,30 @@
+name: Race Detector
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -tags=ci
+    name: Race Detector
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.7
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run race detector
+        shell: bash
+        run: |
+          echo "Running race detector on core packages..."
+          go test -race ./domain/... ./app/... ./infrastructure/... -timeout=5m

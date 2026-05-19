@@ -1,0 +1,96 @@
+package grpcserver
+
+import (
+	"context"
+	"net"
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/server"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/server/grpcserver/protowire"
+	"github.com/Eiyaro/Eiyaro/util/panics"
+	"github.com/pkg/errors"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/peer"
+)
+
+type p2pServer struct {
+	protowire.UnimplementedP2PServer
+	gRPCServer
+}
+
+const p2pMaxMessageSize = 1024 * 1024 * 1024 * 4 // 1GB
+
+// p2pMaxInboundConnections is the max amount of inbound connections for the P2P server.
+// Note that inbound connections are not limited by the gRPC server. (A value of 0 means
+// unlimited inbound connections.) The P2P limiting logic is more applicative, and as such
+// is handled in the ConnectionManager instead.
+const p2pMaxInboundConnections = 0
+
+// NewEiyaroServer creates a new EiyaroServer
+func NewEiyaroServer(listeningAddresses []string) (server.EiyaroServer, error) {
+	gRPCServer := newGRPCServer(listeningAddresses, p2pMaxMessageSize, p2pMaxInboundConnections, "Eiyaro")
+	p2pServer := &p2pServer{gRPCServer: *gRPCServer}
+	protowire.RegisterP2PServer(gRPCServer.server, p2pServer)
+	return p2pServer, nil
+}
+
+func (p *p2pServer) MessageStream(stream protowire.P2P_MessageStreamServer) error {
+	defer panics.HandlePanic(log, "p2pServer.MessageStream", nil)
+
+	return p.handleInboundConnection(stream.Context(), stream)
+}
+
+// Connect connects to the given address
+// This is part of the EiyaroServer interface
+func (p *p2pServer) Connect(address string) (server.Connection, error) {
+	log.Debugf("%s Dialing to %s", p.name, address)
+
+	// Use modern gRPC client with better connection management and backoff
+	connectParams := grpc.ConnectParams{
+		Backoff: backoff.Config{
+			BaseDelay:  1.0 * time.Second,
+			Multiplier: 1.6,
+			Jitter:     0.2,
+			MaxDelay:   120 * time.Second,
+		},
+		MinConnectTimeout: 5 * time.Second,
+	}
+
+	gRPCClientConnection, err := grpc.NewClient(address,
+		grpc.WithConnectParams(connectParams),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s error connecting to %s", p.name, address)
+	}
+
+	client := protowire.NewP2PClient(gRPCClientConnection)
+	stream, err := client.MessageStream(context.Background(), grpc.UseCompressor(gzip.Name),
+		grpc.MaxCallRecvMsgSize(p2pMaxMessageSize), grpc.MaxCallSendMsgSize(p2pMaxMessageSize))
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s error getting client stream for %s", p.name, address)
+	}
+
+	peerInfo, ok := peer.FromContext(stream.Context())
+	if !ok {
+		return nil, errors.Errorf("%s error getting stream peer info from context for %s", p.name, address)
+	}
+	tcpAddress, ok := peerInfo.Addr.(*net.TCPAddr)
+	if !ok {
+		return nil, errors.Errorf("non-tcp addresses are not supported")
+	}
+
+	connection := newConnection(&p.gRPCServer, tcpAddress, stream, gRPCClientConnection)
+
+	err = p.onConnectedHandler(connection)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debugf("%s Connected to %s", p.name, address)
+
+	return connection, nil
+}

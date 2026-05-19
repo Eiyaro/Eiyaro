@@ -1,0 +1,110 @@
+package rpchandlers
+
+import (
+	"encoding/hex"
+	"math"
+
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	"github.com/Eiyaro/Eiyaro/app/rpc/rpccontext"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/txscript"
+	"github.com/Eiyaro/Eiyaro/domain/utxoindex"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/router"
+	"github.com/Eiyaro/Eiyaro/util"
+	"github.com/Eiyaro/Eiyaro/util/memory"
+)
+
+func encodeHexString(buffer []byte, value []byte) ([]byte, string) {
+	if value == nil {
+		return buffer[:0], ""
+	}
+	if len(value) > math.MaxInt/2 {
+		return buffer[:0], ""
+	}
+	needed := hex.EncodedLen(len(value))
+	if needed == 0 {
+		return buffer[:0], ""
+	}
+	if cap(buffer) < needed {
+		buffer = make([]byte, needed)
+	} else {
+		buffer = buffer[:needed]
+	}
+	hex.Encode(buffer, value)
+	return buffer, string(buffer)
+}
+
+// HandleGetUTXOsByAddresses handles the respectively named RPC command with 1-second cache
+func HandleGetUTXOsByAddresses(context *rpccontext.Context, _ *router.Router, request appmessage.Message) (appmessage.Message, error) {
+	if !context.Config.UTXOIndex {
+		errorMessage := &appmessage.GetUTXOsByAddressesResponseMessage{}
+		errorMessage.Error = appmessage.RPCErrorf("Method unavailable when htnd is run without --utxoindex")
+		return errorMessage, nil
+	}
+
+	getUTXOsByAddressesRequest := request.(*appmessage.GetUTXOsByAddressesRequestMessage)
+
+	if getUTXOsByAddressesRequest.Limit > 10_000_000 {
+		errorMessage := &appmessage.GetUTXOsByAddressesResponseMessage{}
+		errorMessage.Error = appmessage.RPCErrorf("Invalid limit: %d. Limit must be between 0 and 10,000,000", getUTXOsByAddressesRequest.Limit)
+		return errorMessage, nil
+	}
+
+	if getUTXOsByAddressesRequest.Limit == 0 || (getUTXOsByAddressesRequest.Limit > context.Config.UTXODefaultMaxLimit && context.Config.UTXODefaultMaxLimit != 0) {
+		getUTXOsByAddressesRequest.Limit = context.Config.UTXODefaultMaxLimit
+	}
+
+	allEntries := make([]*appmessage.UTXOsByAddressesEntry, 0, len(getUTXOsByAddressesRequest.Addresses))
+
+	var reusableHexBuffer []byte
+
+	for _, addressString := range getUTXOsByAddressesRequest.Addresses {
+		address, err := util.DecodeAddress(addressString, context.Config.ActiveNetParams.Prefix)
+		if err != nil {
+			errorMessage := &appmessage.GetUTXOsByAddressesResponseMessage{}
+			errorMessage.Error = appmessage.RPCErrorf("Could not decode address '%s': %s", addressString, err)
+			return errorMessage, nil
+		}
+		scriptPublicKey, err := txscript.PayToAddrScript(address)
+		if err != nil {
+			errorMessage := &appmessage.GetUTXOsByAddressesResponseMessage{}
+			errorMessage.Error = appmessage.RPCErrorf("Could not create a scriptPublicKey for address '%s': %s", addressString, err)
+			return errorMessage, nil
+		}
+
+		utxoOutpointEntryPairsBuffer := memory.Malloc[utxoindex.UTXOPair](1000)
+		if utxoOutpointEntryPairsBuffer == nil {
+			errorMessage := &appmessage.GetUTXOsByAddressesResponseMessage{}
+			errorMessage.Error = appmessage.RPCErrorf("Could not allocate memory for address '%s'", addressString)
+			return errorMessage, nil
+		}
+		utxoOutpointEntryPairs, utxoOutpointEntryPairsBuffer, err := context.UTXOIndex.UTXOs(scriptPublicKey, getUTXOsByAddressesRequest.Limit, utxoOutpointEntryPairsBuffer)
+		if err != nil {
+			memory.Free(utxoOutpointEntryPairsBuffer)
+			return nil, err
+		}
+		if len(utxoOutpointEntryPairs) == 0 {
+			memory.Free(utxoOutpointEntryPairsBuffer)
+			continue
+		}
+		var scriptHex string
+		reusableHexBuffer, scriptHex = encodeHexString(reusableHexBuffer, scriptPublicKey.Script)
+		if scriptHex == "" {
+			memory.Free(utxoOutpointEntryPairsBuffer)
+			continue
+		}
+		sharedScript := &appmessage.RPCScriptPublicKey{
+			Script:  scriptHex,
+			Version: scriptPublicKey.Version,
+		}
+		for _, pair := range utxoOutpointEntryPairs {
+			entry := rpccontext.ConvertUTXOOutpointEntryPairToUTXOsByAddressesEntry(addressString, sharedScript, pair)
+			if entry != nil {
+				allEntries = append(allEntries, entry)
+			}
+		}
+		memory.Free(utxoOutpointEntryPairsBuffer)
+	}
+
+	response := appmessage.NewGetUTXOsByAddressesResponseMessage(allEntries)
+	return response, nil
+}

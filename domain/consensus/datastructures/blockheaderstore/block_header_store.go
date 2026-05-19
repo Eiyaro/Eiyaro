@@ -1,0 +1,213 @@
+package blockheaderstore
+
+import (
+	"github.com/Eiyaro/Eiyaro/domain/consensus/database"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/database/serialization"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/lrucache"
+	"github.com/Eiyaro/Eiyaro/util/staging"
+	"github.com/pkg/errors"
+)
+
+var (
+	bucketName   = []byte("block-headers")
+	countKeyName = []byte("block-headers-count")
+)
+
+// blockHeaderStore represents a store of blocks
+type blockHeaderStore struct {
+	shardID     model.StagingShardID
+	cache       *lrucache.LRUCache[externalapi.BlockHeader]
+	countCached uint64
+	bucket      model.DBBucket
+	countKey    model.DBKey
+}
+
+// New instantiates a new BlockHeaderStore
+func New(dbContext model.DBReader, prefixBucket model.DBBucket, cacheSize int, preallocate bool) (model.BlockHeaderStore, error) {
+	blockHeaderStore := &blockHeaderStore{
+		shardID:  staging.GenerateShardingID(),
+		cache:    lrucache.New[externalapi.BlockHeader](cacheSize, preallocate),
+		bucket:   prefixBucket.Bucket(bucketName),
+		countKey: prefixBucket.Key(countKeyName),
+	}
+
+	err := blockHeaderStore.initializeCount(dbContext)
+	if err != nil {
+		return nil, err
+	}
+
+	return blockHeaderStore, nil
+}
+
+func (bhs *blockHeaderStore) initializeCount(dbContext model.DBReader) error {
+	count := uint64(0)
+	hasCountBytes, err := dbContext.Has(bhs.countKey)
+	if err != nil {
+		return err
+	}
+	if hasCountBytes {
+		countBytes, err := dbContext.Get(bhs.countKey)
+		if errors.Is(err, database.ErrNotFound) {
+			return errors.Wrapf(err, "Header %s does not exist in db", bhs.countKey)
+		}
+		if err != nil {
+			return err
+		}
+		count, err = bhs.deserializeHeaderCount(countBytes)
+		if err != nil {
+			return err
+		}
+	}
+	bhs.countCached = count
+	return nil
+}
+
+// Stage stages the given block header for the given blockHash
+func (bhs *blockHeaderStore) Stage(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash, blockHeader externalapi.BlockHeader) {
+	stagingShard := bhs.stagingShard(stagingArea)
+	stagingShard.toAdd[*blockHash] = blockHeader
+}
+
+func (bhs *blockHeaderStore) IsStaged(stagingArea *model.StagingArea) bool {
+	return bhs.stagingShard(stagingArea).isStaged()
+}
+
+func (bhs *blockHeaderStore) UnstageAll(stagingArea *model.StagingArea) {
+	stagingShard := bhs.stagingShard(stagingArea)
+	stagingShard.toAdd = make(map[externalapi.DomainHash]externalapi.BlockHeader)
+	stagingShard.toDelete = make(map[externalapi.DomainHash]struct{})
+}
+
+// BlockHeader gets the block header associated with the given blockHash
+func (bhs *blockHeaderStore) BlockHeader(dbContext model.DBReader, stagingArea *model.StagingArea,
+	blockHash *externalapi.DomainHash,
+) (externalapi.BlockHeader, error) {
+	stagingShard := bhs.stagingShard(stagingArea)
+
+	return bhs.blockHeader(dbContext, stagingShard, blockHash)
+}
+
+func (bhs *blockHeaderStore) blockHeader(dbContext model.DBReader, stagingShard *blockHeaderStagingShard,
+	blockHash *externalapi.DomainHash,
+) (externalapi.BlockHeader, error) {
+	header, ok := stagingShard.toAdd[*blockHash]
+	if ok && header != nil {
+		return header, nil
+	}
+
+	headerCached, ok := bhs.cache.Get(blockHash)
+	if ok && headerCached != nil {
+		return headerCached, nil
+	}
+
+	headerBytes, err := dbContext.Get(bhs.hashAsKey(blockHash))
+	if errors.Is(err, database.ErrNotFound) {
+		return nil, errors.Wrapf(err, "Header %s does not exist in db", blockHash)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	headerDeserialized, err := bhs.deserializeHeader(headerBytes)
+	if err != nil {
+		return nil, err
+	}
+	bhs.cache.Add(blockHash, headerDeserialized)
+	return headerDeserialized, nil
+}
+
+// HasBlock returns whether a block header with a given hash exists in the store.
+func (bhs *blockHeaderStore) HasBlockHeader(dbContext model.DBReader, stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) (bool, error) {
+	stagingShard := bhs.stagingShard(stagingArea)
+	block, ok := stagingShard.toAdd[*blockHash]
+	if ok && block != nil {
+		return true, nil
+	}
+
+	if bhs.cache.Has(blockHash) {
+		return true, nil
+	}
+
+	exists, err := dbContext.Has(bhs.hashAsKey(blockHash))
+	if err != nil {
+		return false, err
+	}
+
+	return exists, nil
+}
+
+// BlockHeaders gets the block headers associated with the given blockHashes
+func (bhs *blockHeaderStore) BlockHeaders(dbContext model.DBReader, stagingArea *model.StagingArea,
+	blockHashes []*externalapi.DomainHash,
+) ([]externalapi.BlockHeader, error) {
+	stagingShard := bhs.stagingShard(stagingArea)
+
+	headers := make([]externalapi.BlockHeader, len(blockHashes))
+	for i, hash := range blockHashes {
+		var err error
+		headers[i], err = bhs.blockHeader(dbContext, stagingShard, hash)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return headers, nil
+}
+
+// Delete deletes the block associated with the given blockHash
+func (bhs *blockHeaderStore) Delete(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) {
+	stagingShard := bhs.stagingShard(stagingArea)
+	bhs.cache.Remove(blockHash)
+	if _, ok := stagingShard.toAdd[*blockHash]; ok {
+		delete(stagingShard.toAdd, *blockHash)
+		return
+	}
+	stagingShard.toDelete[*blockHash] = struct{}{}
+}
+
+func (bhs *blockHeaderStore) hashAsKey(hash *externalapi.DomainHash) model.DBKey {
+	return bhs.bucket.Key(hash.ByteSlice())
+}
+
+func (bhs *blockHeaderStore) serializeHeader(header externalapi.BlockHeader) ([]byte, error) {
+	dbBlockHeader := serialization.DomainBlockHeaderToDbBlockHeader(header)
+	return dbBlockHeader.MarshalVT()
+}
+
+func (bhs *blockHeaderStore) deserializeHeader(headerBytes []byte) (externalapi.BlockHeader, error) {
+	dbBlockHeader := &serialization.DbBlockHeader{}
+	err := dbBlockHeader.UnmarshalVT(headerBytes)
+	if err != nil {
+		return nil, err
+	}
+	return serialization.DbBlockHeaderToDomainBlockHeader(dbBlockHeader)
+}
+
+func (bhs *blockHeaderStore) Count(stagingArea *model.StagingArea) uint64 {
+	stagingShard := bhs.stagingShard(stagingArea)
+
+	return bhs.count(stagingShard)
+}
+
+func (bhs *blockHeaderStore) count(stagingShard *blockHeaderStagingShard) uint64 {
+	return bhs.countCached + uint64(len(stagingShard.toAdd)) - uint64(len(stagingShard.toDelete))
+}
+
+func (bhs *blockHeaderStore) deserializeHeaderCount(countBytes []byte) (uint64, error) {
+	dbBlockHeaderCount := &serialization.DbBlockHeaderCount{}
+	err := dbBlockHeaderCount.UnmarshalVT(countBytes)
+	if err != nil {
+		return 0, err
+	}
+	return dbBlockHeaderCount.Count, nil
+}
+
+func (bhs *blockHeaderStore) serializeHeaderCount(count uint64) ([]byte, error) {
+	dbBlockHeaderCount := &serialization.DbBlockHeaderCount{Count: count}
+	return dbBlockHeaderCount.MarshalVT()
+}
+
+func (bhs *blockHeaderStore) CacheLen() int {
+	return bhs.cache.Len()
+}

@@ -1,0 +1,71 @@
+package blockrelay
+
+import (
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	"github.com/Eiyaro/Eiyaro/domain"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/router"
+	"github.com/cockroachdb/errors"
+)
+
+// RequestBlockLocatorContext is the interface for the context needed for the HandleRequestBlockLocator flow.
+type RequestBlockLocatorContext interface {
+	Domain() domain.Domain
+}
+
+type handleRequestBlockLocatorFlow struct {
+	RequestBlockLocatorContext
+	incomingRoute, outgoingRoute *router.Route
+}
+
+// HandleRequestBlockLocator handles getBlockLocator messages
+func HandleRequestBlockLocator(context RequestBlockLocatorContext, incomingRoute *router.Route,
+	outgoingRoute *router.Route,
+) error {
+	flow := &handleRequestBlockLocatorFlow{
+		RequestBlockLocatorContext: context,
+		incomingRoute:              incomingRoute,
+		outgoingRoute:              outgoingRoute,
+	}
+	return flow.start()
+}
+
+func (flow *handleRequestBlockLocatorFlow) start() error {
+	for {
+		highHash, limit, err := flow.receiveGetBlockLocator()
+		if err != nil {
+			return err
+		}
+		log.Debugf("Received getBlockLocator with highHash: %s, limit: %d", highHash, limit)
+
+		locator, err := flow.Domain().Consensus().CreateBlockLocatorFromPruningPoint(highHash, limit)
+		if err != nil || len(locator) == 0 {
+			return errors.Wrapf(err, "couldn't build a block "+
+				"locator between the pruning point and %s with limit %d", highHash, limit)
+		}
+
+		err = flow.sendBlockLocator(locator)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (flow *handleRequestBlockLocatorFlow) receiveGetBlockLocator() (highHash *externalapi.DomainHash, limit uint32, err error) {
+	message, err := flow.incomingRoute.Dequeue()
+	if err != nil {
+		return nil, 0, err
+	}
+	msgGetBlockLocator := message.(*appmessage.MsgRequestBlockLocator)
+
+	return msgGetBlockLocator.HighHash, msgGetBlockLocator.Limit, nil
+}
+
+func (flow *handleRequestBlockLocatorFlow) sendBlockLocator(locator externalapi.BlockLocator) error {
+	msgBlockLocator := appmessage.NewMsgBlockLocator(locator)
+	err := flow.outgoingRoute.Enqueue(msgBlockLocator)
+	if err != nil {
+		return err
+	}
+	return nil
+}

@@ -1,0 +1,76 @@
+package blockrelay
+
+import (
+	"runtime"
+	"sync/atomic"
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	peerpkg "github.com/Eiyaro/Eiyaro/app/protocol/peer"
+	"github.com/Eiyaro/Eiyaro/domain"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/router"
+)
+
+// HandleIBDBlockRequestsContext is the interface for the context needed for the HandleIBDBlockRequests flow.
+type HandleIBDBlockRequestsContext interface {
+	Domain() domain.Domain
+}
+
+// HandleIBDBlockRequests listens to appmessage.MsgRequestRelayBlocks messages and sends
+// their corresponding blocks to the requesting peer.
+func HandleIBDBlockRequests(context HandleIBDBlockRequestsContext, incomingRoute *router.Route,
+	outgoingRoute *router.Route, peer *peerpkg.Peer,
+) error {
+	threadcount := runtime.NumCPU() * 8
+	semaphore := make(chan struct{}, threadcount)
+
+	rateLimit := time.NewTicker(time.Second / time.Duration(threadcount))
+	defer rateLimit.Stop()
+	for {
+		<-rateLimit.C // wait for rate limiter
+		var done atomic.Bool
+		message, err := incomingRoute.Dequeue()
+		if err != nil {
+			return err
+		}
+		msgRequestIBDBlocks := message.(*appmessage.MsgRequestIBDBlocks)
+		log.Debugf("Got request for %d ibd blocks", len(msgRequestIBDBlocks.Hashes))
+
+		for i := 0; i < len(msgRequestIBDBlocks.Hashes); i++ {
+			if done.Load() {
+				return nil
+			}
+			hash := msgRequestIBDBlocks.Hashes[i]
+			semaphore <- struct{}{} // acquire
+			go func(hash *externalapi.DomainHash) {
+				defer func() { <-semaphore }() // release
+				if done.Load() {
+					return
+				}
+				// Fetch the block from the database.
+				block, found, err := context.Domain().Consensus().GetBlock(hash)
+				if err != nil {
+					log.Warnf("unable to fetch requested block hash %s: %s", hash, err)
+					done.Store(true)
+					return
+				}
+				if !found {
+					log.Warnf("IBD block %s not found", hash)
+					done.Store(true)
+					return
+				}
+
+				// TODO (Partial nodes): Convert block to partial block if needed
+				log.Debugf("Relaying IBD block %s to peer %s", hash, peer.Address())
+				ibdBlockMessage := appmessage.NewMsgIBDBlock(appmessage.DomainBlockToMsgBlock(block))
+				err = outgoingRoute.Enqueue(ibdBlockMessage)
+				if err != nil {
+					log.Warnf("failed to enqueue block %s: %s", hash, err)
+					done.Store(true)
+					return
+				}
+			}(hash)
+		}
+	}
+}

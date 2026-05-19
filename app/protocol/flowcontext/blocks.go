@@ -1,0 +1,212 @@
+package flowcontext
+
+import (
+	"os"
+	"runtime/debug"
+	"strconv"
+	"time"
+
+	peerpkg "github.com/Eiyaro/Eiyaro/app/protocol/peer"
+	"github.com/Eiyaro/Eiyaro/app/protocol/protocolerrors"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/ruleerrors"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/consensushashing"
+	"github.com/pkg/errors"
+
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+)
+
+// OnNewBlock updates the mempool after a new block arrival, and
+// relays newly unorphaned transactions and possibly rebroadcast
+// manually added transactions when not in IBD.
+func (f *FlowContext) OnNewBlock(block *externalapi.DomainBlock) error {
+	// hash := consensushashing.BlockHash(block)
+	// log.Tracef("OnNewBlock start for block %s", hash)
+	// defer log.Tracef("OnNewBlock end for block %s", hash)
+
+	unorphanedBlocks, err := f.UnorphanBlocks(block)
+	if err != nil {
+		return err
+	}
+
+	// log.Debugf("OnNewBlock: block %s unorphaned %d blocks", hash, len(unorphanedBlocks))
+
+	newBlocks := make([]*externalapi.DomainBlock, 0, len(unorphanedBlocks)+1)
+	newBlocks = append(newBlocks, block)
+	newBlocks = append(newBlocks, unorphanedBlocks...)
+
+	allAcceptedTransactions := make([]*externalapi.DomainTransaction, 0, len(newBlocks))
+	for i := 0; i < len(newBlocks); i++ {
+		// log.Debugf("OnNewBlock: passing block %s transactions to mining manager", hash)
+		acceptedTransactions, err := f.Domain().MiningManager().HandleNewBlockTransactions(newBlocks[i].Transactions)
+		if err != nil {
+			return err
+		}
+		allAcceptedTransactions = append(allAcceptedTransactions, acceptedTransactions...)
+	}
+
+	return f.broadcastTransactionsAfterBlockAdded(newBlocks, allAcceptedTransactions)
+}
+
+// OnNewBlockTemplate calls the handler function whenever a new block template is available for miners.
+func (f *FlowContext) OnNewBlockTemplate() error {
+	// Clear current template cache. Note we call this even if the handler is nil, in order to keep the
+	// state consistent without dependency on external event registration
+	f.Domain().MiningManager().ClearBlockTemplate()
+	if f.onNewBlockTemplateHandler != nil {
+		return f.onNewBlockTemplateHandler()
+	}
+
+	return nil
+}
+
+// OnPruningPointUTXOSetOverride calls the handler function whenever the UTXO set
+// resets due to pruning point change via IBD.
+func (f *FlowContext) OnPruningPointUTXOSetOverride() error {
+	if f.onPruningPointUTXOSetOverrideHandler != nil {
+		return f.onPruningPointUTXOSetOverrideHandler()
+	}
+	return nil
+}
+
+func (f *FlowContext) broadcastTransactionsAfterBlockAdded(
+	_ []*externalapi.DomainBlock, transactionsAcceptedToMempool []*externalapi.DomainTransaction,
+) error {
+	// Don't relay transactions when in IBD.
+	if f.IsIBDRunning() {
+		return nil
+	}
+
+	var txIDsToRebroadcast []*externalapi.DomainTransactionID
+	if f.shouldRebroadcastTransactions() {
+		txsToRebroadcast, err := f.Domain().MiningManager().RevalidateHighPriorityTransactions()
+		if err != nil {
+			return err
+		}
+		txIDsToRebroadcast = consensushashing.TransactionIDs(txsToRebroadcast)
+		f.lastRebroadcastTime = time.Now()
+	}
+
+	totalLen := len(transactionsAcceptedToMempool) + len(txIDsToRebroadcast)
+	txIDsToBroadcast := make([]*externalapi.DomainTransactionID, 0, totalLen)
+
+	for i := range transactionsAcceptedToMempool {
+		txID := consensushashing.TransactionID(transactionsAcceptedToMempool[i])
+		if txID != nil {
+			txIDsToBroadcast = append(txIDsToBroadcast, txID)
+		}
+	}
+
+	txIDsToBroadcast = append(txIDsToBroadcast, txIDsToRebroadcast...)
+
+	if len(txIDsToBroadcast) == 0 {
+		return nil
+	}
+	return f.EnqueueTransactionIDsForPropagation(txIDsToBroadcast)
+}
+
+// SharedRequestedBlocks returns a *blockrelay.SharedRequestedBlocks for sharing
+// data about requested blocks between different peers.
+func (f *FlowContext) SharedRequestedBlocks() *SharedRequestedBlocks {
+	return f.sharedRequestedBlocks
+}
+
+// AddBlock adds the given block to the DAG and propagates it.
+func (f *FlowContext) AddBlock(block *externalapi.DomainBlock) error {
+	if len(block.Transactions) == 0 {
+		return protocolerrors.Errorf(false, "cannot add header only block")
+	}
+
+	err := f.Domain().Consensus().ValidateAndInsertBlock(block, true, false)
+	if err != nil {
+		if errors.As(err, &ruleerrors.RuleError{}) {
+			log.Debugf("Validation failed for block %s with powhash %s: %s", consensushashing.BlockHash(block), block.PoWHash, err)
+		}
+		return err
+	}
+	err = f.OnNewBlockTemplate()
+	if err != nil {
+		return err
+	}
+	err = f.OnNewBlock(block)
+	if err != nil {
+		return err
+	}
+	return f.Broadcast(appmessage.NewMsgInvBlock(consensushashing.BlockHash(block)))
+}
+
+// IsIBDRunning returns true if IBD is currently marked as running
+func (f *FlowContext) IsIBDRunning() bool {
+	f.ibdPeerMutex.RLock()
+	defer f.ibdPeerMutex.RUnlock()
+
+	return f.ibdPeer != nil
+}
+
+// Helper to determine what GC percent to restore to
+func getOriginalGCPercent() int {
+	if gcStr := os.Getenv("GOGC"); gcStr != "" {
+		if gcStr == "off" {
+			return -1 // -1 disables GC
+		}
+		if gc, err := strconv.Atoi(gcStr); err == nil {
+			return gc
+		}
+	}
+	return 100 // Default
+}
+
+// TrySetIBDRunning attempts to set `isInIBD`. Returns false
+// if it is already set. `isNearlySynced` tells us if this is a massive
+// initial sync or just a small catch-up sync.
+func (f *FlowContext) TrySetIBDRunning(ibdPeer *peerpkg.Peer, isNearlySynced bool) bool {
+	f.ibdPeerMutex.Lock()
+	defer f.ibdPeerMutex.Unlock()
+
+	if f.ibdPeer != nil {
+		return false
+	}
+	f.ibdPeer = ibdPeer
+
+	// Only trade CPU for memory if this is a MASSIVE initial sync (not nearly synced)
+	// and the user hasn't explicitly disabled it.
+	if !isNearlySynced && os.Getenv("HTND_HIGCIBD") != "" {
+		log.Infof("Entering Initial IBD - Trading CPU for memory by lowering GC target to 20%%")
+		debug.SetGCPercent(20)
+		f.loweredGCForIBD = true // We need to add this boolean to the FlowContext struct!
+	} else {
+		log.Debugf("Entering Catch-up IBD (or HIGCIBD NOT set) - Keeping normal GC target")
+		f.loweredGCForIBD = false
+	}
+
+	return true
+}
+
+// UnsetIBDRunning unsets isInIBD
+func (f *FlowContext) UnsetIBDRunning() {
+	f.ibdPeerMutex.Lock()
+	defer f.ibdPeerMutex.Unlock()
+
+	if f.ibdPeer == nil {
+		log.Infof("attempted to unset isInIBD when it was not set to begin with")
+	}
+
+	f.ibdPeer = nil
+
+	// Only restore normal GC behavior if WE were the ones who lowered it
+	if f.loweredGCForIBD {
+		origGC := getOriginalGCPercent()
+		log.Infof("Exiting Initial IBD - Restoring normal GC target to %d%%", origGC)
+		debug.SetGCPercent(origGC)
+		f.loweredGCForIBD = false
+	}
+}
+
+// IBDPeer returns the current IBD peer or null if the node is not
+// in IBD
+func (f *FlowContext) IBDPeer() *peerpkg.Peer {
+	f.ibdPeerMutex.RLock()
+	defer f.ibdPeerMutex.RUnlock()
+
+	return f.ibdPeer
+}

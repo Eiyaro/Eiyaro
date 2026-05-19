@@ -1,0 +1,163 @@
+package handshake
+
+import (
+	"strings"
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	peerpkg "github.com/Eiyaro/Eiyaro/app/protocol/peer"
+	"github.com/Eiyaro/Eiyaro/app/protocol/protocolerrors"
+	"github.com/Eiyaro/Eiyaro/infrastructure/logger"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/router"
+	"github.com/pkg/errors"
+)
+
+var (
+	// allowSelfConnections is only used to allow the tests to bypass the self
+	// connection detecting and disconnect logic since they intentionally
+	// do so for testing purposes.
+	allowSelfConnections bool
+
+	// minAcceptableProtocolVersion is the lowest protocol version that a
+	// connected peer may support.
+	minAcceptableProtocolVersion = uint32(7)
+
+	maxAcceptableProtocolVersion = uint32(7)
+)
+
+type receiveVersionFlow struct {
+	HandleHandshakeContext
+	incomingRoute, outgoingRoute *router.Route
+	peer                         *peerpkg.Peer
+}
+
+// ReceiveVersion waits for the peer to send a version message, sends a
+// verack in response, and updates its info accordingly.
+func ReceiveVersion(context HandleHandshakeContext, incomingRoute *router.Route, outgoingRoute *router.Route,
+	peer *peerpkg.Peer,
+) (*appmessage.NetAddress, error) {
+	flow := &receiveVersionFlow{
+		HandleHandshakeContext: context,
+		incomingRoute:          incomingRoute,
+		outgoingRoute:          outgoingRoute,
+		peer:                   peer,
+	}
+
+	return flow.start()
+}
+
+func (flow *receiveVersionFlow) start() (*appmessage.NetAddress, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "receiveVersionFlow.start")
+	defer onEnd()
+
+	log.Debugf("Starting receiveVersionFlow with %s", flow.peer.Address())
+
+	message, err := flow.incomingRoute.DequeueWithTimeout(60 * time.Second)
+	if err != nil {
+		log.Debugf("receiveVersionFlow dequeue error: %s", err)
+		return nil, err
+	}
+
+	log.Debugf("Got version message")
+
+	msgVersion, ok := message.(*appmessage.MsgVersion)
+	if !ok {
+		return nil, protocolerrors.New(true, "a version message must precede all others")
+	}
+
+	if !allowSelfConnections && flow.NetAdapter().ID().IsEqual(msgVersion.ID) {
+		return nil, protocolerrors.New(false, "connected to self")
+	}
+
+	// Disconnect and ban peers from a different network
+	if msgVersion.Network != flow.Config().ActiveNetParams.Name {
+		return nil, protocolerrors.Errorf(true, "wrong network")
+	}
+
+	// Notify and disconnect clients that have a protocol version that is
+	// too old.
+	//
+	// NOTE: If minAcceptableProtocolVersion is raised to be higher than
+	// appmessage.RejectVersion, this should send a reject packet before
+	// disconnecting.
+	if msgVersion.ProtocolVersion < minAcceptableProtocolVersion {
+		return nil, protocolerrors.Errorf(false, "protocol version must be %d or greater",
+			minAcceptableProtocolVersion)
+	}
+
+	err = validatePeerVersion(flow.Config().ForceSameVersion, msgVersion.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+
+	// Disconnect from partial nodes in networks that don't allow them
+	if !flow.Config().ActiveNetParams.EnableNonNativeSubnetworks && msgVersion.SubnetworkID != nil {
+		return nil, protocolerrors.New(true, "partial nodes are not allowed")
+	}
+
+	// Disconnect if:
+	// - we are a full node and the outbound connection we've initiated is a partial node
+	// - the remote node is partial and our subnetwork doesn't match their subnetwork
+	localSubnetworkID := flow.Config().SubnetworkID
+	isLocalNodeFull := localSubnetworkID == nil
+	isRemoteNodeFull := msgVersion.SubnetworkID == nil
+	isOutbound := flow.peer.Connection().IsOutbound()
+	if (isLocalNodeFull && !isRemoteNodeFull && isOutbound) ||
+		(!isLocalNodeFull && !isRemoteNodeFull && !msgVersion.SubnetworkID.Equal(localSubnetworkID)) {
+
+		return nil, protocolerrors.New(false, "incompatible subnetworks")
+	}
+
+	if flow.Config().ProtocolVersion > maxAcceptableProtocolVersion {
+		return nil, errors.Errorf("%d is a non existing protocol version", flow.Config().ProtocolVersion)
+	}
+
+	maxProtocolVersion := flow.Config().ProtocolVersion
+	flow.peer.UpdateFieldsFromMsgVersion(msgVersion, maxProtocolVersion)
+	err = flow.outgoingRoute.Enqueue(appmessage.NewMsgVerAck())
+	if err != nil {
+		return nil, err
+	}
+
+	flow.peer.Connection().SetID(msgVersion.ID)
+
+	return msgVersion.Address, nil
+}
+
+func validatePeerVersion(forceSameVersion bool, remoteUserAgent string) error {
+	if !forceSameVersion {
+		return nil
+	}
+
+	remoteVersion, ok := extractUserAgentVersion(remoteUserAgent, userAgentName)
+	if !ok {
+		return protocolerrors.New(false, "peer is not advertising an htnd version")
+	}
+
+	if remoteVersion != userAgentVersion {
+		return protocolerrors.Errorf(false, "peer version %s does not match local version %s",
+			remoteVersion, userAgentVersion)
+	}
+
+	return nil
+}
+
+func extractUserAgentVersion(userAgent string, agentName string) (string, bool) {
+	for _, agent := range strings.Split(userAgent, "/") {
+		if !strings.HasPrefix(agent, agentName+":") {
+			continue
+		}
+
+		version := strings.TrimPrefix(agent, agentName+":")
+		if commentIndex := strings.Index(version, "("); commentIndex >= 0 {
+			version = version[:commentIndex]
+		}
+		if version == "" {
+			continue
+		}
+
+		return version, true
+	}
+
+	return "", false
+}

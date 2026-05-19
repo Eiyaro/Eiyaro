@@ -1,0 +1,73 @@
+package rpchandlers
+
+import (
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	"github.com/Eiyaro/Eiyaro/app/rpc/rpccontext"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/hashes"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/router"
+)
+
+const getBlockDAGInfoCacheTTL = 250 * time.Millisecond
+
+// HandleGetBlockDAGInfo handles the respectively named RPC command
+func HandleGetBlockDAGInfo(context *rpccontext.Context, _ *router.Router, _ appmessage.Message) (appmessage.Message, error) {
+	now := time.Now()
+	if cached, ok := context.GetBlockDAGInfoCache.Get(now); ok {
+		return cached, nil
+	}
+
+	params := context.Config.ActiveNetParams
+	consensus := context.Domain.Consensus()
+
+	response := appmessage.NewGetBlockDAGInfoResponseMessage()
+	response.NetworkName = params.Name
+
+	syncInfo, err := consensus.GetSyncInfo()
+	if err != nil {
+		response.Error = appmessage.RPCErrorf("Could not get sync info: %s", err)
+		return response, nil
+	}
+
+	response.BlockCount = syncInfo.BlockCount
+	response.HeaderCount = syncInfo.HeaderCount
+
+	tipHashes, err := consensus.Tips()
+	if err != nil {
+		response.Error = appmessage.RPCErrorf("Could not get tips: %s", err)
+		return response, nil
+	}
+	response.TipHashes = hashes.ToStrings(tipHashes)
+
+	virtualInfo, err := consensus.GetVirtualInfo()
+	if err != nil {
+		// During operations like UTXO index reset, virtual info might not be available
+		// Return defaults to handle gracefully without panicking
+		response.VirtualParentHashes = []string{}
+		response.Difficulty = 0
+		response.PastMedianTime = 0
+		response.VirtualDAAScore = 0
+		response.BlueScore = 0
+	} else {
+		response.VirtualParentHashes = hashes.ToStrings(virtualInfo.ParentHashes)
+		response.Difficulty = context.GetDifficultyRatio(virtualInfo.Bits, context.Config.ActiveNetParams)
+		response.PastMedianTime = virtualInfo.PastMedianTime
+		response.VirtualDAAScore = virtualInfo.DAAScore
+		response.BlueScore = virtualInfo.BlueScore
+	}
+
+	pruningPoint, err := context.Domain.Consensus().PruningPoint()
+	if err != nil {
+		response.Error = appmessage.RPCErrorf("Could not get pruning point: %s", err)
+		response.PruningPointHash = ""
+		return response, nil
+	}
+	response.PruningPointHash = pruningPoint.String()
+
+	if response.Error == nil {
+		context.GetBlockDAGInfoCache.Set(response, getBlockDAGInfoCacheTTL, now)
+	}
+
+	return response, nil
+}

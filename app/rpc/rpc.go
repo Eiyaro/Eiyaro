@@ -1,0 +1,137 @@
+package rpc
+
+import (
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	"github.com/Eiyaro/Eiyaro/app/rpc/rpccontext"
+	"github.com/Eiyaro/Eiyaro/app/rpc/rpchandlers"
+	"github.com/Eiyaro/Eiyaro/app/rpc/rpcstats"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/router"
+	"github.com/pkg/errors"
+)
+
+// RPCStats is the global RPC statistics tracker
+var RPCStats = rpcstats.NewStats()
+
+type handler func(context *rpccontext.Context, router *router.Router, request appmessage.Message) (appmessage.Message, error)
+
+var handlers = map[appmessage.MessageCommand]handler{
+	appmessage.CmdGetCurrentNetworkRequestMessage:                           rpchandlers.HandleGetCurrentNetwork,
+	appmessage.CmdSubmitBlockRequestMessage:                                 rpchandlers.HandleSubmitBlock,
+	appmessage.CmdGetBlockTemplateRequestMessage:                            rpchandlers.HandleGetBlockTemplate,
+	appmessage.CmdNotifyBlockAddedRequestMessage:                            rpchandlers.HandleNotifyBlockAdded,
+	appmessage.CmdGetPeerAddressesRequestMessage:                            rpchandlers.HandleGetPeerAddresses,
+	appmessage.CmdGetSelectedTipHashRequestMessage:                          rpchandlers.HandleGetSelectedTipHash,
+	appmessage.CmdGetMempoolEntryRequestMessage:                             rpchandlers.HandleGetMempoolEntry,
+	appmessage.CmdGetConnectedPeerInfoRequestMessage:                        rpchandlers.HandleGetConnectedPeerInfo,
+	appmessage.CmdAddPeerRequestMessage:                                     rpchandlers.HandleAddPeer,
+	appmessage.CmdSubmitTransactionRequestMessage:                           rpchandlers.HandleSubmitTransaction,
+	appmessage.CmdSubmitTransactionReplacementRequestMessage:                rpchandlers.HandleSubmitTransactionReplacement,
+	appmessage.CmdGetFeeEstimateRequestMessage:                              rpchandlers.HandleGetFeeEstimate,
+	appmessage.CmdNotifyVirtualSelectedParentChainChangedRequestMessage:     rpchandlers.HandleNotifyVirtualSelectedParentChainChanged,
+	appmessage.CmdGetBlockRequestMessage:                                    rpchandlers.HandleGetBlock,
+	appmessage.CmdGetBlockByTransactionIDRequestMessage:                     rpchandlers.HandleGetBlockByTransactionID,
+	appmessage.CmdGetSubnetworkRequestMessage:                               rpchandlers.HandleGetSubnetwork,
+	appmessage.CmdGetVirtualSelectedParentChainFromBlockRequestMessage:      rpchandlers.HandleGetVirtualSelectedParentChainFromBlock,
+	appmessage.CmdGetBlocksRequestMessage:                                   rpchandlers.HandleGetBlocks,
+	appmessage.CmdGetBlockCountRequestMessage:                               rpchandlers.HandleGetBlockCount,
+	appmessage.CmdGetBalanceByAddressRequestMessage:                         rpchandlers.HandleGetBalanceByAddress,
+	appmessage.CmdGetBlockDAGInfoRequestMessage:                             rpchandlers.HandleGetBlockDAGInfo,
+	appmessage.CmdResolveFinalityConflictRequestMessage:                     rpchandlers.HandleResolveFinalityConflict,
+	appmessage.CmdNotifyFinalityConflictsRequestMessage:                     rpchandlers.HandleNotifyFinalityConflicts,
+	appmessage.CmdGetMempoolEntriesRequestMessage:                           rpchandlers.HandleGetMempoolEntries,
+	appmessage.CmdShutDownRequestMessage:                                    rpchandlers.HandleShutDown,
+	appmessage.CmdGetHeadersRequestMessage:                                  rpchandlers.HandleGetHeaders,
+	appmessage.CmdNotifyUTXOsChangedRequestMessage:                          rpchandlers.HandleNotifyUTXOsChanged,
+	appmessage.CmdStopNotifyingUTXOsChangedRequestMessage:                   rpchandlers.HandleStopNotifyingUTXOsChanged,
+	appmessage.CmdGetUTXOsByAddressesRequestMessage:                         rpchandlers.HandleGetUTXOsByAddresses,
+	appmessage.CmdGetBalancesByAddressesRequestMessage:                      rpchandlers.HandleGetBalancesByAddresses,
+	appmessage.CmdGetVirtualSelectedParentBlueScoreRequestMessage:           rpchandlers.HandleGetVirtualSelectedParentBlueScore,
+	appmessage.CmdNotifyVirtualSelectedParentBlueScoreChangedRequestMessage: rpchandlers.HandleNotifyVirtualSelectedParentBlueScoreChanged,
+	appmessage.CmdBanRequestMessage:                                         rpchandlers.HandleBan,
+	appmessage.CmdUnbanRequestMessage:                                       rpchandlers.HandleUnban,
+	appmessage.CmdGetInfoRequestMessage:                                     rpchandlers.HandleGetInfo,
+	appmessage.CmdNotifyPruningPointUTXOSetOverrideRequestMessage:           rpchandlers.HandleNotifyPruningPointUTXOSetOverrideRequest,
+	appmessage.CmdStopNotifyingPruningPointUTXOSetOverrideRequestMessage:    rpchandlers.HandleStopNotifyingPruningPointUTXOSetOverrideRequest,
+	appmessage.CmdEstimateNetworkHashesPerSecondRequestMessage:              rpchandlers.HandleEstimateNetworkHashesPerSecond,
+	appmessage.CmdNotifyVirtualDaaScoreChangedRequestMessage:                rpchandlers.HandleNotifyVirtualDaaScoreChanged,
+	appmessage.CmdNotifyNewBlockTemplateRequestMessage:                      rpchandlers.HandleNotifyNewBlockTemplate,
+	appmessage.CmdGetCoinSupplyRequestMessage:                               rpchandlers.HandleGetCoinSupply,
+	appmessage.CmdGetMempoolEntriesByAddressesRequestMessage:                rpchandlers.HandleGetMempoolEntriesByAddresses,
+	appmessage.CmdGetUsableAddressesRequestMessage:                          rpchandlers.HandleGetUsableAddresses,
+	appmessage.CmdGetPaginatedUTXOsByAddressesRequestMessage:                rpchandlers.HandleGetPaginatedUTXOsByAddresses,
+}
+
+func (m *Manager) routerInitializer(rtr *router.Router, netConnection *netadapter.NetConnection) {
+	messageTypes := make([]appmessage.MessageCommand, 0, len(handlers))
+	for messageType := range handlers {
+		messageTypes = append(messageTypes, messageType)
+	}
+	rtr.OutgoingRoute().SetOnCapacityReachedHandler(func(route *router.Route, message appmessage.Message) {
+		log.Warnf("Disconnecting slow RPC client %s because outgoing route '%s' is full (%d/%d) while sending '%s'",
+			netConnection, route.Name(), route.Length(), route.Capacity(), message.Command())
+		netConnection.Disconnect()
+	})
+	incomingRoute, err := rtr.AddIncomingRoute("rpc router", messageTypes)
+	if err != nil {
+		panic(err)
+	}
+	m.context.NotificationManager.AddListener(rtr)
+
+	spawn("routerInitializer-handleIncomingMessages", func() {
+		defer m.context.NotificationManager.RemoveListener(rtr)
+
+		err := m.handleIncomingMessages(rtr, incomingRoute, netConnection)
+		m.handleError(err, netConnection)
+	})
+}
+
+func (m *Manager) handleIncomingMessages(router *router.Router, incomingRoute *router.Route, netConnection *netadapter.NetConnection) error {
+	clientAddress := netConnection.Address()
+	outgoingRoute := router.OutgoingRoute()
+	for {
+		request, err := incomingRoute.Dequeue()
+		if err != nil {
+			return err
+		}
+		handler, ok := handlers[request.Command()]
+		if !ok {
+			return errors.Errorf("unknown RPC command %s", request.Command())
+		}
+
+		// Record the RPC request for statistics
+		RPCStats.RecordRequest(clientAddress, request.Command().String())
+
+		response, err := handler(m.context, router, request)
+		if err != nil {
+			return err
+		}
+		err = outgoingRoute.Enqueue(response)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (m *Manager) handleError(err error, netConnection *netadapter.NetConnection) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, router.ErrTimeout) {
+		log.Warnf("Got timeout from %s. Disconnecting...", netConnection)
+		netConnection.Disconnect()
+		return
+	}
+	if errors.Is(err, router.ErrRouteClosed) {
+		return
+	}
+	if errors.Is(err, router.ErrRouteCapacityReached) {
+		log.Warnf("Disconnecting slow RPC client %s after outgoing route capacity was reached", netConnection)
+		netConnection.Disconnect()
+		return
+	}
+	// Any other error came from request handling. Treat it as a per-connection failure
+	// rather than crashing the entire node.
+	log.Errorf("RPC client %s disconnected due to handler error: %v", netConnection, err)
+	netConnection.Disconnect()
+}

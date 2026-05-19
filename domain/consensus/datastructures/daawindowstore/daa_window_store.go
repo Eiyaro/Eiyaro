@@ -1,0 +1,99 @@
+package daawindowstore
+
+import (
+	"encoding/binary"
+
+	"github.com/Eiyaro/Eiyaro/domain/consensus/database"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/database/serialization"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/lrucachehashpairtoblockghostdagdatahashpair"
+	"github.com/Eiyaro/Eiyaro/util/staging"
+	"github.com/cockroachdb/errors"
+)
+
+var bucketName = []byte("daa-window")
+
+type daaWindowStore struct {
+	shardID model.StagingShardID
+	cache   *lrucachehashpairtoblockghostdagdatahashpair.LRUCache
+	bucket  model.DBBucket
+}
+
+// New instantiates a new BlocksWithTrustedDataDAAWindowStore
+func New(prefixBucket model.DBBucket, cacheSize int, preallocate bool) model.BlocksWithTrustedDataDAAWindowStore {
+	return &daaWindowStore{
+		shardID: staging.GenerateShardingID(),
+		cache:   lrucachehashpairtoblockghostdagdatahashpair.New(cacheSize, preallocate),
+		bucket:  prefixBucket.Bucket(bucketName),
+	}
+}
+
+func (daaws *daaWindowStore) Stage(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash, index uint64, pair *externalapi.BlockGHOSTDAGDataHashPair) {
+	stagingShard := daaws.stagingShard(stagingArea)
+
+	key := newDBKey(blockHash, index)
+	if _, ok := stagingShard.toAdd[key]; !ok {
+		stagingShard.toAdd[key] = pair
+		daaws.cache.Add(blockHash, index, pair)
+	}
+}
+
+func (daaws *daaWindowStore) DAAWindowBlock(dbContext model.DBReader, stagingArea *model.StagingArea, blockHash *externalapi.DomainHash, index uint64) (*externalapi.BlockGHOSTDAGDataHashPair, error) {
+	stagingShard := daaws.stagingShard(stagingArea)
+
+	dbKey := newDBKey(blockHash, index)
+	pair, ok := stagingShard.toAdd[dbKey]
+	if ok && pair != nil {
+		return pair, nil
+	}
+	pairCached, ok := daaws.cache.Get(blockHash, index)
+	if ok && pairCached != nil {
+		return pairCached, nil
+	}
+
+	pairBytes, err := dbContext.Get(daaws.key(dbKey))
+	if errors.Is(err, database.ErrNotFound) {
+		return nil, errors.Wrapf(err, "DAA window %s does not exist in db", blockHash)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	pairDeserialized, err := deserializePairBytes(pairBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	daaws.cache.Add(blockHash, index, pairDeserialized)
+	return pairDeserialized, nil
+}
+
+func deserializePairBytes(pairBytes []byte) (*externalapi.BlockGHOSTDAGDataHashPair, error) {
+	dbPair := &serialization.DbBlockGHOSTDAGDataHashPair{}
+	err := dbPair.UnmarshalVT(pairBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return serialization.DbBlockGHOSTDAGDataHashPairToBlockGHOSTDAGDataHashPair(dbPair)
+}
+
+func (daaws *daaWindowStore) IsStaged(stagingArea *model.StagingArea) bool {
+	return daaws.stagingShard(stagingArea).isStaged()
+}
+
+func (daaws *daaWindowStore) UnstageAll(stagingArea *model.StagingArea) {
+	stagingShard := daaws.stagingShard(stagingArea)
+	stagingShard.toAdd = make(map[dbKey]*externalapi.BlockGHOSTDAGDataHashPair)
+}
+
+func (daaws *daaWindowStore) key(key dbKey) model.DBKey {
+	keyIndexBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(keyIndexBytes, key.index)
+	return daaws.bucket.Bucket(key.blockHash.ByteSlice()).Key(keyIndexBytes)
+}
+
+func (daaws *daaWindowStore) CacheLen() int {
+	return daaws.cache.Len()
+}

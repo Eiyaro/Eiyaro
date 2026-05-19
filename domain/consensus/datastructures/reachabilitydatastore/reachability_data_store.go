@@ -1,0 +1,188 @@
+package reachabilitydatastore
+
+import (
+	"github.com/Eiyaro/Eiyaro/domain/consensus/database/serialization"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/lrucache"
+	"github.com/Eiyaro/Eiyaro/infrastructure/db/database"
+	"github.com/Eiyaro/Eiyaro/util/staging"
+	"github.com/cockroachdb/errors"
+)
+
+var (
+	reachabilityDataBucketName     = []byte("reachability-data")
+	reachabilityReindexRootKeyName = []byte("reachability-reindex-root")
+)
+
+// reachabilityDataStore represents a store of ReachabilityData
+type reachabilityDataStore struct {
+	shardID                      model.StagingShardID
+	reachabilityDataCache        *lrucache.LRUCache[model.ReachabilityData]
+	reachabilityReindexRootCache *externalapi.DomainHash
+
+	reachabilityDataBucket     model.DBBucket
+	reachabilityReindexRootKey model.DBKey
+}
+
+// New instantiates a new ReachabilityDataStore
+func New(prefixBucket model.DBBucket, cacheSize int, preallocate bool) model.ReachabilityDataStore {
+	return &reachabilityDataStore{
+		shardID:                    staging.GenerateShardingID(),
+		reachabilityDataCache:      lrucache.New[model.ReachabilityData](cacheSize, preallocate),
+		reachabilityDataBucket:     prefixBucket.Bucket(reachabilityDataBucketName),
+		reachabilityReindexRootKey: prefixBucket.Key(reachabilityReindexRootKeyName),
+	}
+}
+
+// StageReachabilityData stages the given reachabilityData for the given blockHash
+func (rds *reachabilityDataStore) StageReachabilityData(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash, reachabilityData model.ReachabilityData) {
+	stagingShard := rds.stagingShard(stagingArea)
+
+	stagingShard.reachabilityData[*blockHash] = reachabilityData
+}
+
+func (rds *reachabilityDataStore) Delete(dbContext model.DBWriter) error {
+	cursor, err := dbContext.Cursor(rds.reachabilityDataBucket)
+	if err != nil {
+		return err
+	}
+	rds.reachabilityDataCache.Clear()
+
+	for ok := cursor.First(); ok; ok = cursor.Next() {
+		key, err := cursor.Key()
+		if err != nil {
+			return err
+		}
+
+		err = dbContext.Delete(key)
+		if err != nil {
+			return err
+		}
+	}
+
+	return dbContext.Delete(rds.reachabilityReindexRootKey)
+}
+
+// StageReachabilityReindexRoot stages the given reachabilityReindexRoot
+func (rds *reachabilityDataStore) StageReachabilityReindexRoot(stagingArea *model.StagingArea, reachabilityReindexRoot *externalapi.DomainHash) {
+	stagingShard := rds.stagingShard(stagingArea)
+
+	stagingShard.reachabilityReindexRoot = reachabilityReindexRoot
+}
+
+func (rds *reachabilityDataStore) IsStaged(stagingArea *model.StagingArea) bool {
+	return rds.stagingShard(stagingArea).isStaged()
+}
+
+// ReachabilityData returns the reachabilityData associated with the given blockHash
+func (rds *reachabilityDataStore) ReachabilityData(dbContext model.DBReader, stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) (model.ReachabilityData, error) {
+	stagingShard := rds.stagingShard(stagingArea)
+
+	reachabilityData, ok := stagingShard.reachabilityData[*blockHash]
+	if ok && reachabilityData != nil {
+		return reachabilityData, nil
+	}
+
+	reachabilityDataCached, ok := rds.reachabilityDataCache.Get(blockHash)
+	if ok && reachabilityDataCached != nil {
+		return reachabilityDataCached, nil
+	}
+
+	reachabilityDataBytes, err := dbContext.Get(rds.reachabilityDataBlockHashAsKey(blockHash))
+	if errors.Is(err, database.ErrNotFound) {
+		return nil, errors.Wrapf(err, "Reachability data for block %s does not exist in db", blockHash)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	deserializedReachabilityData, err := rds.deserializeReachabilityData(reachabilityDataBytes)
+	if err != nil {
+		return nil, err
+	}
+	rds.reachabilityDataCache.Add(blockHash, deserializedReachabilityData)
+	return deserializedReachabilityData, nil
+}
+
+func (rds *reachabilityDataStore) HasReachabilityData(dbContext model.DBReader, stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) (bool, error) {
+	_, err := rds.ReachabilityData(dbContext, stagingArea, blockHash)
+	if database.IsNotFoundError(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// ReachabilityReindexRoot returns the current reachability reindex root
+func (rds *reachabilityDataStore) ReachabilityReindexRoot(dbContext model.DBReader, stagingArea *model.StagingArea) (*externalapi.DomainHash, error) {
+	stagingShard := rds.stagingShard(stagingArea)
+
+	if stagingShard.reachabilityReindexRoot != nil {
+		return stagingShard.reachabilityReindexRoot, nil
+	}
+
+	if rds.reachabilityReindexRootCache != nil {
+		return rds.reachabilityReindexRootCache, nil
+	}
+
+	reachabilityReindexRootBytes, err := dbContext.Get(rds.reachabilityReindexRootKey)
+	if errors.Is(err, database.ErrNotFound) {
+		return nil, errors.Wrapf(err, "Reachability reindex root does not exist in db")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	reachabilityReindexRoot, err := rds.deserializeReachabilityReindexRoot(reachabilityReindexRootBytes)
+	if err != nil {
+		return nil, err
+	}
+	rds.reachabilityReindexRootCache = reachabilityReindexRoot
+	return reachabilityReindexRoot, nil
+}
+
+func (rds *reachabilityDataStore) reachabilityDataBlockHashAsKey(hash *externalapi.DomainHash) model.DBKey {
+	return rds.reachabilityDataBucket.Key(hash.ByteSlice())
+}
+
+func (rds *reachabilityDataStore) serializeReachabilityData(reachabilityData model.ReachabilityData) ([]byte, error) {
+	return serialization.ReachablityDataToDBReachablityData(reachabilityData).MarshalVT()
+}
+
+func (rds *reachabilityDataStore) deserializeReachabilityData(reachabilityDataBytes []byte) (model.ReachabilityData, error) {
+	dbReachabilityData := &serialization.DbReachabilityData{}
+	err := dbReachabilityData.UnmarshalVT(reachabilityDataBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return serialization.DBReachablityDataToReachablityData(dbReachabilityData)
+}
+
+func (rds *reachabilityDataStore) serializeReachabilityReindexRoot(reachabilityReindexRoot *externalapi.DomainHash) ([]byte, error) {
+	return serialization.DomainHashToDbHash(reachabilityReindexRoot).MarshalVT()
+}
+
+func (rds *reachabilityDataStore) deserializeReachabilityReindexRoot(reachabilityReindexRootBytes []byte) (*externalapi.DomainHash, error) {
+	dbHash := &serialization.DbHash{}
+	err := dbHash.UnmarshalVT(reachabilityReindexRootBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return serialization.DbHashToDomainHash(dbHash)
+}
+
+func (rds *reachabilityDataStore) UnstageAll(stagingArea *model.StagingArea) {
+	stagingShard := rds.stagingShard(stagingArea)
+	stagingShard.reachabilityData = make(map[externalapi.DomainHash]model.ReachabilityData)
+	stagingShard.reachabilityReindexRoot = nil
+}
+
+func (rds *reachabilityDataStore) CacheLen() int {
+	return rds.reachabilityDataCache.Len()
+}

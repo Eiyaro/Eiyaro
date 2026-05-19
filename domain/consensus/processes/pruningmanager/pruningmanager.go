@@ -1,0 +1,1468 @@
+package pruningmanager
+
+import (
+	"sort"
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/consensushashing"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/constants"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/multiset"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/utxo"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/virtual"
+	"github.com/Eiyaro/Eiyaro/infrastructure/db/database"
+	"github.com/Eiyaro/Eiyaro/infrastructure/logger"
+	"github.com/Eiyaro/Eiyaro/util/staging"
+	"github.com/pkg/errors"
+)
+
+// pruningManager resolves and manages the current pruning point
+type pruningManager struct {
+	databaseContext model.DBManager
+
+	dagTraversalManager   model.DAGTraversalManager
+	dagTopologyManager    model.DAGTopologyManager
+	consensusStateManager model.ConsensusStateManager
+	finalityManager       model.FinalityManager
+
+	consensusStateStore                 model.ConsensusStateStore
+	ghostdagDataStore                   model.GHOSTDAGDataStore
+	pruningStore                        model.PruningStore
+	blockStatusStore                    model.BlockStatusStore
+	headerSelectedTipStore              model.HeaderSelectedTipStore
+	blocksWithTrustedDataDAAWindowStore model.BlocksWithTrustedDataDAAWindowStore
+	multiSetStore                       model.MultisetStore
+	acceptanceDataStore                 model.AcceptanceDataStore
+	blocksStore                         model.BlockStore
+	blockHeaderStore                    model.BlockHeaderStore
+	utxoDiffStore                       model.UTXODiffStore
+	daaBlocksStore                      model.DAABlocksStore
+	reachabilityDataStore               model.ReachabilityDataStore
+
+	isArchivalNode                  bool
+	genesisHash                     *externalapi.DomainHash
+	finalityInterval                uint64
+	pruningDepth                    uint64
+	deletionDepth                   uint64
+	dataRetentionDuration           time.Duration
+	pruningInterval                 time.Duration
+	shouldSanityCheckPruningUTXOSet bool
+	k                               []externalapi.KType
+	difficultyAdjustmentWindowSize  []int
+
+	targetTimePerBlock []time.Duration
+
+	lastPruningTime            time.Time
+	cachedPruningPoint         *externalapi.DomainHash
+	cachedPruningPointAnticone []*externalapi.DomainHash
+}
+
+// New instantiates a new PruningManager
+func New(
+	databaseContext model.DBManager,
+
+	dagTraversalManager model.DAGTraversalManager,
+	dagTopologyManager model.DAGTopologyManager,
+	consensusStateManager model.ConsensusStateManager,
+	finalityManager model.FinalityManager,
+
+	consensusStateStore model.ConsensusStateStore,
+	ghostdagDataStore model.GHOSTDAGDataStore,
+	pruningStore model.PruningStore,
+	blockStatusStore model.BlockStatusStore,
+	headerSelectedTipStore model.HeaderSelectedTipStore,
+	multiSetStore model.MultisetStore,
+	acceptanceDataStore model.AcceptanceDataStore,
+	blocksStore model.BlockStore,
+	blockHeaderStore model.BlockHeaderStore,
+	utxoDiffStore model.UTXODiffStore,
+	daaBlocksStore model.DAABlocksStore,
+	reachabilityDataStore model.ReachabilityDataStore,
+	blocksWithTrustedDataDAAWindowStore model.BlocksWithTrustedDataDAAWindowStore,
+
+	isArchivalNode bool,
+	genesisHash *externalapi.DomainHash,
+	finalityInterval uint64,
+	pruningDepth uint64,
+	deletionDepth uint64,
+	dataRetentionDuration time.Duration,
+	pruningInterval time.Duration,
+	shouldSanityCheckPruningUTXOSet bool,
+	k []externalapi.KType,
+	difficultyAdjustmentWindowSize []int,
+	targetTimePerBlock []time.Duration,
+) model.PruningManager {
+	pm := &pruningManager{
+		databaseContext:       databaseContext,
+		dagTraversalManager:   dagTraversalManager,
+		dagTopologyManager:    dagTopologyManager,
+		consensusStateManager: consensusStateManager,
+		finalityManager:       finalityManager,
+
+		consensusStateStore:                 consensusStateStore,
+		ghostdagDataStore:                   ghostdagDataStore,
+		pruningStore:                        pruningStore,
+		blockStatusStore:                    blockStatusStore,
+		multiSetStore:                       multiSetStore,
+		acceptanceDataStore:                 acceptanceDataStore,
+		blocksStore:                         blocksStore,
+		blockHeaderStore:                    blockHeaderStore,
+		utxoDiffStore:                       utxoDiffStore,
+		headerSelectedTipStore:              headerSelectedTipStore,
+		daaBlocksStore:                      daaBlocksStore,
+		reachabilityDataStore:               reachabilityDataStore,
+		blocksWithTrustedDataDAAWindowStore: blocksWithTrustedDataDAAWindowStore,
+
+		isArchivalNode:                  isArchivalNode,
+		genesisHash:                     genesisHash,
+		pruningDepth:                    pruningDepth,
+		deletionDepth:                   deletionDepth,
+		dataRetentionDuration:           dataRetentionDuration,
+		pruningInterval:                 pruningInterval,
+		finalityInterval:                finalityInterval,
+		shouldSanityCheckPruningUTXOSet: shouldSanityCheckPruningUTXOSet,
+		k:                               k,
+		difficultyAdjustmentWindowSize:  difficultyAdjustmentWindowSize,
+		targetTimePerBlock:              targetTimePerBlock,
+	}
+	// Reload the durable timestamp at startup
+	lastTime, err := pruningStore.LastPruningTime(databaseContext)
+	if err == nil {
+		pm.lastPruningTime = lastTime
+	} else if !database.IsNotFoundError(err) {
+		log.Errorf("Failed to load last pruning time: %s", err)
+	}
+
+	return pm
+}
+
+func (pm *pruningManager) UpdatePruningPointByVirtual(stagingArea *model.StagingArea) error {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.UpdatePruningPointByVirtual")
+	defer onEnd()
+	hasPruningPoint, err := pm.pruningStore.HasPruningPoint(pm.databaseContext, stagingArea)
+	if err != nil {
+		return err
+	}
+
+	if !hasPruningPoint {
+		hasGenesis, err := pm.blocksStore.HasBlock(pm.databaseContext, stagingArea, pm.genesisHash)
+		if err != nil {
+			return err
+		}
+
+		if hasGenesis {
+			err = pm.savePruningPoint(stagingArea, pm.genesisHash)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Pruning point should initially set manually on a pruned-headers node.
+		return nil
+	}
+
+	virtualGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, model.VirtualBlockHash, false)
+	if database.IsNotFoundError(err) {
+		// Virtual GHOSTDAG data may not exist yet (e.g., after an aborted IBD stage or
+		// in a staging consensus that hasn't initialized virtual). In such cases there
+		// is nothing to update yet.
+		log.Infof("UpdatePruningPointByVirtual skipped: virtual GHOSTDAG data not found (%s)", model.VirtualBlockHash)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if virtualGHOSTDAGData.SelectedParent().Equal(pm.genesisHash) {
+		return nil
+	}
+
+	newPruningPoint, newCandidate, err := pm.nextPruningPointAndCandidateByBlockHash(stagingArea, virtualGHOSTDAGData.SelectedParent(), nil)
+	if err != nil {
+		return err
+	}
+
+	currentCandidate, err := pm.pruningPointCandidate(stagingArea)
+	if err != nil {
+		return err
+	}
+
+	if !newCandidate.Equal(currentCandidate) {
+		log.Debugf("Staged a new pruning candidate, old: %s, new: %s", currentCandidate, newCandidate)
+		pm.pruningStore.StagePruningPointCandidate(stagingArea, newCandidate)
+	}
+
+	currentPruningPoint, err := pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea)
+	if err != nil {
+		return err
+	}
+
+	if !newPruningPoint.Equal(currentPruningPoint) {
+		if constants.GetBlockVersion() < 5 {
+			currentPruningPointGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, currentPruningPoint, false)
+			if err != nil {
+				return err
+			}
+
+			newPruningPointGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, newPruningPoint, false)
+			if err != nil {
+				return err
+			}
+			if pm.finalityScore(newPruningPointGHOSTDAGData.BlueScore()) > pm.finalityScore(currentPruningPointGHOSTDAGData.BlueScore())+1 {
+				return errors.Errorf("cannot advance pruning point by more than one finality interval at once")
+			}
+		}
+
+		log.Infof("Moving pruning point from %s to %s", currentPruningPoint, newPruningPoint)
+		err = pm.savePruningPoint(stagingArea, newPruningPoint)
+		if err != nil {
+			return err
+		}
+		log.Infof("Moving pruning point finished.")
+	}
+
+	return nil
+}
+
+type blockIteratorFromOneBlock struct {
+	done, isClosed bool
+	hash           *externalapi.DomainHash
+}
+
+func (b *blockIteratorFromOneBlock) First() bool {
+	if b.isClosed {
+		panic("Tried using a closed blockIteratorFromOneBlock")
+	}
+
+	b.done = false
+	return true
+}
+
+func (b *blockIteratorFromOneBlock) Next() bool {
+	if b.isClosed {
+		panic("Tried using a closed blockIteratorFromOneBlock")
+	}
+
+	b.done = true
+	return false
+}
+
+func (b *blockIteratorFromOneBlock) Get() (*externalapi.DomainHash, error) {
+	if b.isClosed {
+		panic("Tried using a closed blockIteratorFromOneBlock")
+	}
+
+	return b.hash, nil
+}
+
+func (b *blockIteratorFromOneBlock) Close() error {
+	if b.isClosed {
+		panic("Tried using a closed blockIteratorFromOneBlock")
+	}
+
+	b.isClosed = true
+	return nil
+}
+
+func (pm *pruningManager) nextPruningPointAndCandidateByBlockHash(stagingArea *model.StagingArea,
+	blockHash, suggestedLowHash *externalapi.DomainHash,
+) (*externalapi.DomainHash, *externalapi.DomainHash, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.nextPruningPointAndCandidateByBlockHash")
+	defer onEnd()
+
+	currentCandidate, err := pm.pruningPointCandidate(stagingArea)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lowHash := currentCandidate
+	if suggestedLowHash != nil {
+		isSuggestedLowHashInSelectedParentChainOfCurrentCandidate, err := pm.dagTopologyManager.IsInSelectedParentChainOf(stagingArea, suggestedLowHash, currentCandidate)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if !isSuggestedLowHashInSelectedParentChainOfCurrentCandidate {
+			isCurrentCandidateInSelectedParentChainOfSuggestedLowHash, err := pm.dagTopologyManager.IsInSelectedParentChainOf(stagingArea, currentCandidate, suggestedLowHash)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			if !isCurrentCandidateInSelectedParentChainOfSuggestedLowHash {
+				panic(errors.Errorf("suggested low hash %s is not on the same selected chain as the pruning candidate %s", suggestedLowHash, currentCandidate))
+			}
+			lowHash = suggestedLowHash
+		}
+	}
+
+	currentPruningPoint, err := pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ghostdagData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, blockHash, false)
+	if database.IsNotFoundError(err) {
+		log.Infof("nextPruningPointAndCandidateByBlockHash failed to retrieve with %s\n", blockHash)
+		return nil, nil, err
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	currentPruningPointGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, currentPruningPoint, false)
+	if database.IsNotFoundError(err) {
+		log.Infof("nextPruningPointAndCandidateByBlockHash failed to retrieve with %s\n", currentPruningPoint)
+		return nil, nil, err
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// We iterate until the selected parent of the given block, in order to allow a situation where the given block hash
+	// belongs to the virtual. This shouldn't change anything since the max blue score difference between a block and its
+	// selected parent is K, and K << pm.pruningDepth.
+	var iterator model.BlockIterator
+	if blockHash.Equal(lowHash) {
+		iterator = &blockIteratorFromOneBlock{hash: lowHash}
+	} else {
+		iterator, err = pm.dagTraversalManager.SelectedChildIterator(stagingArea, ghostdagData.SelectedParent(), lowHash, true)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	defer iterator.Close()
+
+	// Finding the next pruning point candidate: look for the latest
+	// selected child of the current candidate that is in depth of at
+	// least pm.pruningDepth blocks from the virtual selected parent.
+	//
+	// Note: Sometimes the current candidate is less than pm.pruningDepth
+	// from the virtual. This can happen only if the virtual blue score
+	// got smaller, because virtual blue score is not guaranteed to always
+	// increase (because sometimes a block with higher blue work can have
+	// lower blue score).
+	// In such cases we still keep the same candidate because it's guaranteed
+	// that a block that was once in depth of pm.pruningDepth cannot be
+	// reorged without causing a finality conflict first.
+	newCandidate := currentCandidate
+
+	newPruningPoint := currentPruningPoint
+	newPruningPointGHOSTDAGData := currentPruningPointGHOSTDAGData
+	for ok := iterator.First(); ok; ok = iterator.Next() {
+		selectedChild, err := iterator.Get()
+		if err != nil {
+			return nil, nil, err
+		}
+		selectedChildGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, selectedChild, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		// log.Infof("ghostdagData.BlueScore()-selectedChildGHOSTDAGData.BlueScore() %d < pm.pruningDepth %d", ghostdagData.BlueScore()-selectedChildGHOSTDAGData.BlueScore(), pm.pruningDepth)
+		if ghostdagData.BlueScore()-selectedChildGHOSTDAGData.BlueScore() < pm.pruningDepth {
+			break
+		}
+
+		newCandidate = selectedChild
+		newCandidateGHOSTDAGData := selectedChildGHOSTDAGData
+
+		// We move the pruning point every time the candidate's finality score is
+		// bigger than the current pruning point finality score.
+		// log.Infof("pm.finalityScore(newCandidateGHOSTDAGData.BlueScore()) %d > pm.finalityScore(newPruningPointGHOSTDAGData.BlueScore()) %d", pm.finalityScore(newCandidateGHOSTDAGData.BlueScore()), pm.finalityScore(newPruningPointGHOSTDAGData.BlueScore()))
+		if pm.finalityScore(newCandidateGHOSTDAGData.BlueScore()) > pm.finalityScore(newPruningPointGHOSTDAGData.BlueScore()) {
+			newPruningPoint = newCandidate
+			newPruningPointGHOSTDAGData = newCandidateGHOSTDAGData
+		}
+	}
+
+	return newPruningPoint, newCandidate, nil
+}
+
+func (pm *pruningManager) isInPruningFutureOrInVirtualPast(stagingArea *model.StagingArea, block *externalapi.DomainHash,
+	pruningPoint *externalapi.DomainHash, virtualParents []*externalapi.DomainHash,
+) (bool, error) {
+	hasPruningPointInPast, err := pm.dagTopologyManager.IsAncestorOf(stagingArea, pruningPoint, block)
+	if err != nil {
+		return false, err
+	}
+	if hasPruningPointInPast {
+		return true, nil
+	}
+	// Because virtual doesn't have reachability data, we need to check reachability
+	// using it parents.
+	isInVirtualPast, err := pm.dagTopologyManager.IsAncestorOfAny(stagingArea, block, virtualParents)
+	if err != nil {
+		return false, err
+	}
+	if isInVirtualPast {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (pm *pruningManager) deletePastBlocks(stagingArea *model.StagingArea, pruningPoint *externalapi.DomainHash) error {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.deletePastBlocks")
+	defer onEnd()
+
+	// Go over all pruningPoint.Past and pruningPoint.Anticone that's not in virtual.Past
+	queue := pm.dagTraversalManager.NewDownHeap(stagingArea)
+	virtualParents, err := pm.dagTopologyManager.Parents(stagingArea, model.VirtualBlockHash)
+	if err != nil {
+		return err
+	}
+
+	// Start queue with all tips that are below the pruning point (and on the way remove them from list of tips)
+	prunedTips, err := pm.pruneTips(stagingArea, pruningPoint, virtualParents)
+	if err != nil {
+		return err
+	}
+	err = queue.PushSlice(prunedTips)
+	if err != nil {
+		return err
+	}
+
+	// Add pruningPoint.Parents to queue
+	parents, err := pm.dagTopologyManager.Parents(stagingArea, pruningPoint)
+	if err != nil {
+		return err
+	}
+
+	if !virtual.ContainsOnlyVirtualGenesis(parents) {
+		err = queue.PushSlice(parents)
+		if err != nil {
+			return err
+		}
+	}
+
+	blocksToKeep, err := pm.calculateBlocksToKeep(stagingArea, pruningPoint)
+	if err != nil {
+		return err
+	}
+	err = pm.deleteBlocksDownward(stagingArea, queue, blocksToKeep)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (pm *pruningManager) calculateBlocksToKeep(stagingArea *model.StagingArea,
+	pruningPoint *externalapi.DomainHash,
+) (map[externalapi.DomainHash]struct{}, error) {
+	pruningPointAnticone, err := pm.dagTraversalManager.AnticoneFromVirtualPOV(stagingArea, pruningPoint)
+	if err != nil {
+		return nil, err
+	}
+	pruningPointAndItsAnticone := append([]*externalapi.DomainHash{}, pruningPointAnticone...)
+	pruningPointAndItsAnticone = append(pruningPointAndItsAnticone, pruningPoint)
+	blocksToKeep := make(map[externalapi.DomainHash]struct{})
+	for _, blockHash := range pruningPointAndItsAnticone {
+		blocksToKeep[*blockHash] = struct{}{}
+		blockWindow, err := pm.dagTraversalManager.BlockWindow(stagingArea, blockHash, pm.difficultyAdjustmentWindowSize[constants.GetBlockVersion()-1])
+		if err != nil {
+			return nil, err
+		}
+		for _, windowBlockHash := range blockWindow {
+			blocksToKeep[*windowBlockHash] = struct{}{}
+		}
+	}
+	return blocksToKeep, nil
+}
+
+func (pm *pruningManager) deleteBlocksDownward(stagingArea *model.StagingArea,
+	queue model.BlockHeap, blocksToKeep map[externalapi.DomainHash]struct{},
+) error {
+	visited := map[externalapi.DomainHash]struct{}{}
+	// Prune everything in the queue including its past, unless it's in `blocksToKeep`
+	for queue.Len() > 0 {
+		current := queue.Pop()
+		if _, ok := visited[*current]; ok {
+			continue
+		}
+		visited[*current] = struct{}{}
+
+		shouldAddParents := true
+		if _, ok := blocksToKeep[*current]; !ok {
+			alreadyPruned, err := pm.deleteBlock(stagingArea, current)
+			if err != nil {
+				return err
+			}
+			shouldAddParents = !alreadyPruned
+		}
+
+		if shouldAddParents {
+			parents, err := pm.dagTopologyManager.Parents(stagingArea, current)
+			if err != nil {
+				return err
+			}
+
+			if !virtual.ContainsOnlyVirtualGenesis(parents) {
+				err = queue.PushSlice(parents)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (pm *pruningManager) pruneTips(stagingArea *model.StagingArea, pruningPoint *externalapi.DomainHash,
+	virtualParents []*externalapi.DomainHash,
+) (prunedTips []*externalapi.DomainHash, err error) {
+	// Find P.AC that's not in V.Past
+	dagTips, err := pm.consensusStateStore.Tips(stagingArea, pm.databaseContext)
+	if err != nil {
+		return nil, err
+	}
+	newTips := make([]*externalapi.DomainHash, 0, len(dagTips))
+	for _, tip := range dagTips {
+		isInPruningFutureOrInVirtualPast, err := pm.isInPruningFutureOrInVirtualPast(stagingArea, tip, pruningPoint, virtualParents)
+		if err != nil {
+			return nil, err
+		}
+		if !isInPruningFutureOrInVirtualPast {
+			prunedTips = append(prunedTips, tip)
+		} else {
+			newTips = append(newTips, tip)
+		}
+	}
+	pm.consensusStateStore.StageTips(stagingArea, newTips)
+
+	return prunedTips, nil
+}
+
+func (pm *pruningManager) savePruningPoint(stagingArea *model.StagingArea, pruningPointHash *externalapi.DomainHash) error {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.savePruningPoint")
+	defer onEnd()
+	err := pm.pruningStore.StagePruningPoint(pm.databaseContext, stagingArea, pruningPointHash)
+	if err != nil {
+		return err
+	}
+	pm.pruningStore.StageStartUpdatingPruningPointUTXOSet(stagingArea)
+
+	// Call UpdatePruningPointIfRequired immediately after setting the flag
+	// Rather than after every single validate_and_insert_block
+	err = pm.UpdatePruningPointIfRequired()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (pm *pruningManager) deleteBlock(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) (
+	alreadyPruned bool, err error,
+) {
+	status, err := pm.blockStatusStore.Get(pm.databaseContext, stagingArea, blockHash)
+	if database.IsNotFoundError(err) {
+		log.Infof("deleteBlock failed to retrieve with %s\n", blockHash)
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if status == externalapi.StatusHeaderOnly {
+		return true, nil
+	}
+
+	pm.blockStatusStore.Stage(stagingArea, blockHash, externalapi.StatusHeaderOnly)
+	if pm.isArchivalNode {
+		return false, nil
+	}
+
+	pm.multiSetStore.Delete(stagingArea, blockHash)
+	pm.acceptanceDataStore.Delete(stagingArea, blockHash)
+	pm.blocksStore.Delete(stagingArea, blockHash)
+	pm.utxoDiffStore.Delete(stagingArea, blockHash)
+	pm.daaBlocksStore.Delete(stagingArea, blockHash)
+
+	return false, nil
+}
+
+func (pm *pruningManager) IsValidPruningPoint(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) (bool, error) {
+	if *pm.genesisHash == *blockHash {
+		return true, nil
+	}
+
+	headersSelectedTip, err := pm.headerSelectedTipStore.HeadersSelectedTip(pm.databaseContext, stagingArea)
+	if err != nil {
+		return false, err
+	}
+
+	// A pruning point has to be in the selected chain of the headers selected tip.
+	headersSelectedTipGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, headersSelectedTip, false)
+	if database.IsNotFoundError(err) {
+		log.Infof("IsValidPruningPoint failed to retrieve with %s\n", headersSelectedTip)
+		return false, err
+	}
+	if err != nil {
+		return false, err
+	}
+
+	isInSelectedParentChainOfHeadersSelectedTip, err := pm.dagTopologyManager.IsInSelectedParentChainOf(stagingArea, blockHash, headersSelectedTip)
+	if err != nil {
+		return false, err
+	}
+
+	if !isInSelectedParentChainOfHeadersSelectedTip {
+		return false, nil
+	}
+
+	ghostdagData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, blockHash, false)
+	if err != nil {
+		return false, err
+	}
+
+	// A pruning point has to be at depth of at least pm.pruningDepth
+	if headersSelectedTipGHOSTDAGData.BlueScore()-ghostdagData.BlueScore() < pm.pruningDepth {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (pm *pruningManager) ArePruningPointsViolatingFinality(stagingArea *model.StagingArea,
+	pruningPoints []externalapi.BlockHeader,
+) (bool, error) {
+	virtualFinalityPoint, err := pm.finalityManager.VirtualFinalityPoint(stagingArea)
+	if err != nil {
+		return false, err
+	}
+
+	virtualFinalityPointFinalityPoint, err := pm.finalityManager.FinalityPoint(stagingArea, virtualFinalityPoint, false)
+	if err != nil {
+		return false, err
+	}
+
+	// We need to check if virtualFinalityPointFinalityPoint is in the selected chain of
+	// the most recent known pruning point, so we iterate the pruning points from the most
+	// recent one until we find a known pruning point.
+	for i := len(pruningPoints) - 1; i >= 0; i-- {
+		blockHash := consensushashing.HeaderHash(pruningPoints[i])
+		exists, err := pm.blockStatusStore.Exists(pm.databaseContext, stagingArea, blockHash)
+		if err != nil {
+			return false, err
+		}
+
+		if !exists {
+			continue
+		}
+
+		isInSelectedParentChainOfVirtualFinalityPointFinalityPoint, err := pm.dagTopologyManager.
+			IsInSelectedParentChainOf(stagingArea, virtualFinalityPointFinalityPoint, blockHash)
+		if err != nil {
+			return false, err
+		}
+
+		return !isInSelectedParentChainOfVirtualFinalityPointFinalityPoint, nil
+	}
+
+	// If no pruning point is known, there's definitely a finality violation
+	return true, nil
+}
+
+func (pm *pruningManager) ArePruningPointsInValidChain(stagingArea *model.StagingArea) (bool, error) {
+	lastPruningPoint, err := pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea)
+	if err != nil {
+		log.Errorf("pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea): %s", err)
+		return false, err
+	}
+
+	expectedPruningPoints := make([]*externalapi.DomainHash, 0)
+	headersSelectedTip, err := pm.headerSelectedTipStore.HeadersSelectedTip(pm.databaseContext, stagingArea)
+	if err != nil {
+		log.Errorf("pm.headerSelectedTipStore.HeadersSelectedTip(pm.databaseContext, stagingArea): %s", err)
+		return false, err
+	}
+
+	// Build the list of expected pruning points from selected tip to last pruning point
+	current := headersSelectedTip
+	for !current.Equal(lastPruningPoint) {
+		header, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, current)
+		if err != nil {
+			log.Errorf("pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, current): %s", err)
+			return false, err
+		}
+
+		if len(expectedPruningPoints) == 0 || !expectedPruningPoints[len(expectedPruningPoints)-1].Equal(header.PruningPoint()) {
+			expectedPruningPoints = append(expectedPruningPoints, header.PruningPoint())
+		}
+
+		currentGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, current, false)
+		if database.IsNotFoundError(err) {
+			log.Infof("ArePruningPointsInValidChain failed to retrieve with %s\n", current)
+			return false, err
+		}
+		if err != nil {
+			log.Errorf("pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, current): %s", err)
+			return false, err
+		}
+
+		current = currentGHOSTDAGData.SelectedParent()
+	}
+
+	if len(expectedPruningPoints) == 0 {
+		log.Errorf("Expected pruning points list is empty, can't match against stored pruning points")
+		return false, nil
+	}
+
+	// Validate stored pruning points against expected pruning points
+	lastPruningPointIndex, err := pm.pruningStore.CurrentPruningPointIndex(pm.databaseContext, stagingArea)
+	if err != nil {
+		log.Errorf("pm.pruningStore.CurrentPruningPointIndex(pm.databaseContext, stagingArea): %s", err)
+		return false, err
+	}
+
+	for i := lastPruningPointIndex; ; i-- {
+		pruningPoint, err := pm.pruningStore.PruningPointByIndex(pm.databaseContext, stagingArea, i)
+		if err != nil {
+			log.Errorf("pm.pruningStore.PruningPointByIndex(pm.databaseContext, stagingArea, %d): %s", i, err)
+			return false, err
+		}
+
+		// Compare with the last expected pruning point
+		// expectedPruningPoint := expectedPruningPoints[len(expectedPruningPoints)-1]
+		expectedPruningPoints = expectedPruningPoints[:len(expectedPruningPoints)-1]
+		// if !pruningPoint.Equal(expectedPruningPoint) {
+		// 	log.Errorf("Pruning point %s is not expected pruning point %s at index %d", pruningPoint.String(), expectedPruningPoint.String(), i)
+		// 	return false, nil
+		// }
+
+		if i == 0 {
+			if len(expectedPruningPoints) != 0 {
+				log.Errorf("Expected pruning points list is not empty after processing all pruning points")
+				return false, nil
+			}
+			if !pruningPoint.Equal(pm.genesisHash) {
+				log.Errorf("Pruning point at index 0 is not genesis block")
+				return false, nil
+			}
+			break
+		}
+	}
+
+	return true, nil
+}
+
+func (pm *pruningManager) pruningPointCandidate(stagingArea *model.StagingArea) (*externalapi.DomainHash, error) {
+	hasPruningPointCandidate, err := pm.pruningStore.HasPruningPointCandidate(pm.databaseContext, stagingArea)
+	if err != nil {
+		return nil, err
+	}
+
+	if !hasPruningPointCandidate {
+		return pm.genesisHash, nil
+	}
+
+	return pm.pruningStore.PruningPointCandidate(pm.databaseContext, stagingArea)
+}
+
+// validateUTXOSetFitsCommitment makes sure that the calculated UTXOSet of the new pruning point fits the commitment.
+// This is a sanity test, to make sure that htnd doesn't store, and subsequently sends syncing peers the wrong UTXOSet.
+func (pm *pruningManager) validateUTXOSetFitsCommitment(stagingArea *model.StagingArea, pruningPointHash *externalapi.DomainHash) error {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.validateUTXOSetFitsCommitment")
+	defer onEnd()
+
+	utxoSetIterator, err := pm.pruningStore.PruningPointUTXOIterator(pm.databaseContext)
+	if err != nil {
+		return err
+	}
+	defer utxoSetIterator.Close()
+
+	utxoSetMultiset := multiset.New()
+	for ok := utxoSetIterator.First(); ok; ok = utxoSetIterator.Next() {
+		outpoint, entry, err := utxoSetIterator.Get()
+		if err != nil {
+			return err
+		}
+		serializedUTXO, err := utxo.SerializeUTXO(entry, outpoint)
+		if err != nil {
+			return err
+		}
+		utxoSetMultiset.Add(serializedUTXO)
+	}
+	utxoSetHash := utxoSetMultiset.Hash()
+
+	header, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, pruningPointHash)
+	if err != nil {
+		return err
+	}
+	expectedUTXOCommitment := header.UTXOCommitment()
+
+	if !expectedUTXOCommitment.Equal(utxoSetHash) {
+		return errors.Errorf("Calculated UTXOSet for next pruning point %s doesn't match it's UTXO commitment\n"+
+			"Calculated UTXOSet hash: %s. Commitment: %s",
+			pruningPointHash, utxoSetHash, expectedUTXOCommitment)
+	}
+
+	log.Debugf("Validated the pruning point %s UTXO commitment: %s", pruningPointHash, utxoSetHash)
+
+	return nil
+}
+
+// This function takes 2 points (currentPruningHash, previousPruningHash) and traverses the UTXO diff children DAG
+// until it finds a common descendant, at the worse case this descendant will be the current SelectedTip.
+// it then creates 2 diffs, one from that descendant to previousPruningHash and another from that descendant to currentPruningHash
+// then using `DiffFrom` it converts these 2 diffs to a single diff from previousPruningHash to currentPruningHash.
+// this way should be the fastest way to get the difference between the 2 points, and should perform much better than restoring the full UTXO set.
+func (pm *pruningManager) calculateDiffBetweenPreviousAndCurrentPruningPoints(stagingArea *model.StagingArea, currentPruningHash *externalapi.DomainHash) (externalapi.UTXODiff, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.calculateDiffBetweenPreviousAndCurrentPruningPoints")
+	defer onEnd()
+	if currentPruningHash.Equal(pm.genesisHash) {
+		log.Infof("Current pruning point hash is equal to genesis")
+		iter, err := pm.consensusStateManager.RestorePastUTXOSetIterator(stagingArea, currentPruningHash)
+		if err != nil {
+			return nil, err
+		}
+		set := make(map[externalapi.DomainOutpoint]externalapi.UTXOEntry)
+		for ok := iter.First(); ok; ok = iter.Next() {
+			outpoint, entry, err := iter.Get()
+			if database.IsNotFoundError(err) {
+				log.Infof("calculateDiffBetweenPreviousAndCurrentPruningPoints failed to retrieve\n")
+				return nil, err
+			}
+			if err != nil {
+				return nil, err
+			}
+			set[*outpoint] = entry
+		}
+		return utxo.NewUTXODiffFromCollections(utxo.NewUTXOCollection(set), utxo.NewUTXOCollection(make(map[externalapi.DomainOutpoint]externalapi.UTXOEntry)))
+	}
+
+	pruningPointIndex, err := pm.pruningStore.CurrentPruningPointIndex(pm.databaseContext, stagingArea)
+	if err != nil {
+		return nil, err
+	}
+
+	if pruningPointIndex == 0 {
+		return nil, errors.Errorf("previous pruning point doesn't exist")
+	}
+
+	previousPruningHash, err := pm.pruningStore.PruningPointByIndex(pm.databaseContext, stagingArea, pruningPointIndex-1)
+	if err != nil {
+		return nil, err
+	}
+	currentPruningGhostDAG, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, currentPruningHash, false)
+	if err != nil {
+		return nil, err
+	}
+	previousPruningGhostDAG, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, previousPruningHash, false)
+	if err != nil {
+		return nil, err
+	}
+
+	currentPruningCurrentDiffChild := currentPruningHash
+	previousPruningCurrentDiffChild := previousPruningHash
+	// We need to use BlueWork because it's the only thing that's monotonic in the whole DAG
+	// We use the BlueWork to know which point is currently lower on the DAG so we can keep climbing its children,
+	// that way we keep climbing on the lowest point until they both reach the exact same descendant
+	currentPruningCurrentDiffChildBlueWork := currentPruningGhostDAG.BlueWork()
+	previousPruningCurrentDiffChildBlueWork := previousPruningGhostDAG.BlueWork()
+
+	var diffHashesFromPrevious []*externalapi.DomainHash
+	var diffHashesFromCurrent []*externalapi.DomainHash
+
+diffTraversalLoop:
+	for {
+		// if currentPruningCurrentDiffChildBlueWork > previousPruningCurrentDiffChildBlueWork
+		switch {
+		case currentPruningCurrentDiffChildBlueWork.Cmp(previousPruningCurrentDiffChildBlueWork) == 1:
+			diffHashesFromPrevious = append(diffHashesFromPrevious, previousPruningCurrentDiffChild)
+			previousPruningCurrentDiffChild, err = pm.utxoDiffStore.UTXODiffChild(pm.databaseContext, stagingArea, previousPruningCurrentDiffChild)
+			if err != nil {
+				return nil, err
+			}
+			diffChildGhostDag, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, previousPruningCurrentDiffChild, false)
+			if err != nil {
+				return nil, err
+			}
+			previousPruningCurrentDiffChildBlueWork = diffChildGhostDag.BlueWork()
+		case currentPruningCurrentDiffChild.Equal(previousPruningCurrentDiffChild):
+			break diffTraversalLoop
+		default:
+			diffHashesFromCurrent = append(diffHashesFromCurrent, currentPruningCurrentDiffChild)
+			currentPruningCurrentDiffChild, err = pm.utxoDiffStore.UTXODiffChild(pm.databaseContext, stagingArea, currentPruningCurrentDiffChild)
+			if err != nil {
+				return nil, err
+			}
+			diffChildGhostDag, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, currentPruningCurrentDiffChild, false)
+			if err != nil {
+				return nil, err
+			}
+			currentPruningCurrentDiffChildBlueWork = diffChildGhostDag.BlueWork()
+		}
+	}
+	// The order in which we apply the diffs should be from top to bottom, but we traversed from bottom to top
+	// so we apply the diffs in reverse order.
+
+	oldDiff := utxo.NewMutableUTXODiff()
+	log.Infof("Diff hashes from previous %d", len(diffHashesFromPrevious))
+	for i := len(diffHashesFromPrevious) - 1; i >= 0; i-- {
+		utxoDiff, err := pm.utxoDiffStore.UTXODiff(pm.databaseContext, stagingArea, diffHashesFromPrevious[i])
+		if err != nil {
+			return nil, err
+		}
+		err = oldDiff.WithDiffInPlace(utxoDiff)
+		if err != nil {
+			return nil, err
+		}
+	}
+	newDiff := utxo.NewMutableUTXODiff()
+	log.Infof("Diff hashes from current %d", len(diffHashesFromCurrent))
+	for i := len(diffHashesFromCurrent) - 1; i >= 0; i-- {
+		utxoDiff, err := pm.utxoDiffStore.UTXODiff(pm.databaseContext, stagingArea, diffHashesFromCurrent[i])
+		if err != nil {
+			return nil, err
+		}
+		err = newDiff.WithDiffInPlace(utxoDiff)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return oldDiff.DiffFrom(newDiff.ToImmutable())
+}
+
+// This function takes 2 chain blocks (currentPruningHash, previousPruningHash) and finds
+// the UTXO diff between them by iterating over acceptance data of the chain blocks in between.
+func (pm *pruningManager) calculateDiffBetweenPreviousAndCurrentPruningPointsUsingAcceptanceData(stagingArea *model.StagingArea, currentPruningHash *externalapi.DomainHash) (externalapi.UTXODiff, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.calculateDiffBetweenPreviousAndCurrentPruningPoints__UsingAcceptanceData")
+	defer onEnd()
+	if currentPruningHash.Equal(pm.genesisHash) {
+		iter, err := pm.consensusStateManager.RestorePastUTXOSetIterator(stagingArea, currentPruningHash)
+		if err != nil {
+			return nil, err
+		}
+		set := make(map[externalapi.DomainOutpoint]externalapi.UTXOEntry)
+		for ok := iter.First(); ok; ok = iter.Next() {
+			outpoint, entry, err := iter.Get()
+			if err != nil {
+				return nil, err
+			}
+			set[*outpoint] = entry
+		}
+		return utxo.NewUTXODiffFromCollections(utxo.NewUTXOCollection(set), utxo.NewUTXOCollection(make(map[externalapi.DomainOutpoint]externalapi.UTXOEntry)))
+	}
+
+	pruningPointIndex, err := pm.pruningStore.CurrentPruningPointIndex(pm.databaseContext, stagingArea)
+	if err != nil {
+		return nil, err
+	}
+
+	if pruningPointIndex == 0 {
+		return nil, errors.Errorf("previous pruning point doesn't exist")
+	}
+
+	previousPruningHash, err := pm.pruningStore.PruningPointByIndex(pm.databaseContext, stagingArea, pruningPointIndex-1)
+	if err != nil {
+		return nil, err
+	}
+
+	utxoDiff := utxo.NewMutableUTXODiff()
+
+	iterator, err := pm.dagTraversalManager.SelectedChildIterator(stagingArea, currentPruningHash, previousPruningHash, false)
+	if err != nil {
+		return nil, err
+	}
+	defer iterator.Close()
+
+	for ok := iterator.First(); ok; ok = iterator.Next() {
+		child, err := iterator.Get()
+		if err != nil {
+			return nil, err
+		}
+		chainBlockAcceptanceData, err := pm.acceptanceDataStore.Get(pm.databaseContext, stagingArea, child)
+		if database.IsNotFoundError(err) {
+			log.Infof("calculateDiffBetweenPreviousAndCurrentPruningPointsUsingAcceptanceData failed to retrieve with %s\n", child)
+			return nil, err
+		}
+		if err != nil {
+			return nil, err
+		}
+		chainBlockHeader, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, child)
+		if err != nil {
+			return nil, err
+		}
+		for _, blockAcceptanceData := range chainBlockAcceptanceData {
+			for _, transactionAcceptanceData := range blockAcceptanceData.TransactionAcceptanceData {
+				if transactionAcceptanceData.IsAccepted {
+					err = utxoDiff.AddTransaction(transactionAcceptanceData.Transaction, chainBlockHeader.DAAScore())
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+
+	return utxoDiff.ToImmutable(), err
+}
+
+// finalityScore is the number of finality intervals passed since
+// the given block.
+func (pm *pruningManager) finalityScore(blueScore uint64) uint64 {
+	if pm.finalityInterval == 0 {
+		return 0
+	}
+	return blueScore / pm.finalityInterval
+}
+
+func (pm *pruningManager) ClearImportedPruningPointData() error {
+	err := pm.pruningStore.ClearImportedPruningPointMultiset(pm.databaseContext)
+	if err != nil {
+		return err
+	}
+	return pm.pruningStore.ClearImportedPruningPointUTXOs(pm.databaseContext)
+}
+
+func (pm *pruningManager) AppendImportedPruningPointUTXOs(outpointAndUTXOEntryPairs []*externalapi.OutpointAndUTXOEntryPair) error {
+	dbTx, err := pm.databaseContext.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dbTx.RollbackUnlessClosed() }()
+
+	importedMultiset, err := pm.pruningStore.ImportedPruningPointMultiset(dbTx)
+	if err != nil {
+		if !database.IsNotFoundError(err) {
+			return err
+		}
+		importedMultiset = multiset.New()
+	}
+	for _, outpointAndUTXOEntryPair := range outpointAndUTXOEntryPairs {
+		serializedUTXO, err := utxo.SerializeUTXO(outpointAndUTXOEntryPair.UTXOEntry, outpointAndUTXOEntryPair.Outpoint)
+		if err != nil {
+			return err
+		}
+		importedMultiset.Add(serializedUTXO)
+	}
+	err = pm.pruningStore.UpdateImportedPruningPointMultiset(dbTx, importedMultiset)
+	if err != nil {
+		return err
+	}
+
+	err = pm.pruningStore.AppendImportedPruningPointUTXOs(dbTx, outpointAndUTXOEntryPairs)
+	if err != nil {
+		return err
+	}
+
+	return dbTx.Commit()
+}
+
+func (pm *pruningManager) UpdatePruningPointIfRequired() error {
+	hadStartedUpdatingPruningPointUTXOSet, err := pm.pruningStore.HadStartedUpdatingPruningPointUTXOSet(pm.databaseContext)
+	if err != nil {
+		return err
+	}
+	if !hadStartedUpdatingPruningPointUTXOSet {
+		return nil
+	}
+
+	log.Infof("Pruning point UTXO set update is required")
+	err = pm.updatePruningPoint()
+	if err != nil {
+		return err
+	}
+	log.Info("Pruning point UTXO set updated")
+
+	return nil
+}
+
+func (pm *pruningManager) CheckIfShouldDeletePastBlocks(stagingArea *model.StagingArea, pruningPoint *externalapi.DomainHash) (bool, *externalapi.DomainHash) {
+	if pm.deletionDepth == 0 {
+		return true, pruningPoint
+	}
+	pruningPointIndex, err := pm.pruningStore.CurrentPruningPointIndex(pm.databaseContext, stagingArea)
+	if err != nil {
+		return false, nil
+	}
+	if pruningPointIndex < pm.deletionDepth {
+		return false, nil
+	}
+	previousDeletionPoint, err := pm.pruningStore.PruningPointByIndex(pm.databaseContext, stagingArea, pruningPointIndex-pm.deletionDepth)
+	if err != nil {
+		return false, nil
+	}
+	previousDeletionPointHeader, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, previousDeletionPoint)
+	if err != nil {
+		return false, nil
+	}
+	currentPruningPointHeader, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, pruningPoint)
+	if err != nil {
+		return false, nil
+	}
+	if currentPruningPointHeader.BlueScore()-previousDeletionPointHeader.BlueScore() < pm.pruningDepth {
+		return false, nil
+	}
+	return true, previousDeletionPoint
+}
+
+// shouldDeferDeletion returns true if block deletion should be skipped this time based on
+// data retention and pruning interval constraints. It is designed to be safe during IBD:
+// when the pruning point is far in the past (as it is during initial or partial IBD),
+// the retention check will not trigger, so deletion proceeds normally.
+func (pm *pruningManager) shouldDeferDeletion(stagingArea *model.StagingArea, pruningPoint *externalapi.DomainHash) bool {
+	// Check pruning interval: if configured and not enough time has passed since the last deletion, defer.
+	if pm.pruningInterval > 0 && !pm.lastPruningTime.IsZero() {
+		if time.Since(pm.lastPruningTime) < pm.pruningInterval {
+			log.Debugf("Pruning interval not reached: %s since last pruning, interval is %s",
+				time.Since(pm.lastPruningTime), pm.pruningInterval)
+			return true
+		}
+	}
+
+	// Check data retention: if configured, check whether the pruning point's blocks
+	// are still within the retention window (i.e., too recent to delete).
+	if pm.dataRetentionDuration > 0 {
+		pruningPointHeader, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, pruningPoint)
+		if err != nil {
+			log.Warnf("Failed to get pruning point header for retention check: %s", err)
+			return false
+		}
+		pruningPointTime := time.UnixMilli(pruningPointHeader.TimeInMilliseconds())
+		blockAge := time.Since(pruningPointTime)
+		if blockAge < pm.dataRetentionDuration {
+			log.Debugf("Data retention constraint: pruning point age %s is less than retention duration %s",
+				blockAge, pm.dataRetentionDuration)
+			return true
+		}
+	}
+
+	return false
+}
+
+func (pm *pruningManager) updatePruningPoint() error {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "updatePruningPoint")
+	defer onEnd()
+
+	logger.LogMemoryStats(log, "updatePruningPoint start")
+	defer logger.LogMemoryStats(log, "updatePruningPoint end")
+
+	stagingArea := model.NewStagingArea()
+	log.Info("Getting the pruning point")
+	pruningPoint, err := pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea)
+	if err != nil {
+		return err
+	}
+
+	log.Info("Restoring the pruning point UTXO set from acceptance data")
+	utxoSetDiff, err := pm.calculateDiffBetweenPreviousAndCurrentPruningPointsUsingAcceptanceData(stagingArea, pruningPoint)
+	if err != nil {
+		log.Infof("Calculating pruning points diff through accepntance data failed %s. Falling back to calculation "+
+			"through iterating UTXO diff children", err)
+		utxoSetDiff, err = pm.calculateDiffBetweenPreviousAndCurrentPruningPoints(stagingArea, pruningPoint)
+		log.Info("Restored the pruning point UTXO set from UTXO diff children")
+		if err != nil {
+			return err
+		}
+	}
+	log.Info("Restored the pruning point UTXO set from acceptance data")
+
+	log.Info("Updating the pruning point UTXO set")
+	err = pm.pruningStore.UpdatePruningPointUTXOSet(pm.databaseContext, utxoSetDiff)
+	if err != nil {
+		return err
+	}
+	log.Info("Validating the UTXO set fits commitment")
+	if pm.shouldSanityCheckPruningUTXOSet && !pruningPoint.Equal(pm.genesisHash) {
+		err = pm.validateUTXOSetFitsCommitment(stagingArea, pruningPoint)
+		if err != nil {
+			return err
+		}
+	}
+	var newPruningTime *time.Time
+	if pm.shouldDeferDeletion(stagingArea, pruningPoint) {
+		log.Infof("Pruning point advanced, but block deletion deferred (data retention/interval not met)")
+	} else {
+		log.Infof("Deletion of past blocks")
+		err = pm.deletePastBlocks(stagingArea, pruningPoint)
+		if err != nil {
+			return err
+		}
+
+		t := time.Now()
+		newPruningTime = &t
+		// Stage the durable timestamp to the database in the same transaction
+		pm.pruningStore.StageLastPruningTime(stagingArea, *newPruningTime)
+	}
+
+	log.Info("Commit all changes")
+	err = staging.CommitAllChanges(pm.databaseContext, stagingArea)
+	if err != nil {
+		return err
+	}
+
+	if newPruningTime != nil {
+		pm.lastPruningTime = *newPruningTime
+	}
+
+	// Invalidate the cached pruning point and anticone since the pruning point just moved
+	pm.cachedPruningPoint = nil
+	pm.cachedPruningPointAnticone = nil
+
+	log.Info("Finishing updating the pruning point UTXO set")
+	return pm.pruningStore.FinishUpdatingPruningPointUTXOSet(pm.databaseContext)
+}
+
+func (pm *pruningManager) PruneAllBlocksBelow(stagingArea *model.StagingArea, pruningPointHash *externalapi.DomainHash) error {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "PruneAllBlocksBelow")
+	defer onEnd()
+
+	iterator, err := pm.blocksStore.AllBlockHashesIterator(pm.databaseContext)
+	if err != nil {
+		return err
+	}
+	defer iterator.Close()
+
+	for ok := iterator.First(); ok; ok = iterator.Next() {
+		blockHash, err := iterator.Get()
+		if err != nil {
+			return err
+		}
+		isInPastOfPruningPoint, err := pm.dagTopologyManager.IsAncestorOf(stagingArea, pruningPointHash, blockHash)
+		if err != nil {
+			return err
+		}
+		if !isInPastOfPruningPoint {
+			continue
+		}
+		_, err = pm.deleteBlock(stagingArea, blockHash)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (pm *pruningManager) PruningPointAndItsAnticone() ([]*externalapi.DomainHash, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "PruningPointAndItsAnticone")
+	defer onEnd()
+
+	stagingArea := model.NewStagingArea()
+	pruningPoint, err := pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea)
+	if err != nil {
+		return nil, err
+	}
+
+	// By the Prunality proof, the pruning point anticone is a closed set (i.e., guaranteed not to change) ,
+	// so we can safely cache it.
+	if pm.cachedPruningPoint != nil && pm.cachedPruningPoint.Equal(pruningPoint) {
+		return append([]*externalapi.DomainHash{pruningPoint}, pm.cachedPruningPointAnticone...), nil
+	}
+
+	pruningPointAnticone, err := pm.dagTraversalManager.AnticoneFromVirtualPOV(stagingArea, pruningPoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Sorting the blocks in topological order
+	var sortErr error
+	sort.Slice(pruningPointAnticone, func(i, j int) bool {
+		headerI, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, pruningPointAnticone[i])
+		if err != nil {
+			sortErr = err
+			return false
+		}
+
+		headerJ, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, pruningPointAnticone[j])
+		if err != nil {
+			sortErr = err
+			return false
+		}
+
+		return headerI.BlueWork().Cmp(headerJ.BlueWork()) < 0
+	})
+	if sortErr != nil {
+		return nil, sortErr
+	}
+
+	pm.cachedPruningPoint = pruningPoint
+	pm.cachedPruningPointAnticone = pruningPointAnticone
+
+	// The pruning point should always come first
+	return append([]*externalapi.DomainHash{pruningPoint}, pruningPointAnticone...), nil
+}
+
+func (pm *pruningManager) ExpectedHeaderPruningPoint(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) (*externalapi.DomainHash, error) {
+	ghostdagData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, blockHash, false)
+	if database.IsNotFoundError(err) {
+		// Virtual GHOSTDAG data might be missing during early init / IBD teardown.
+		// For virtual, fall back to current pruning point (or genesis if unset) so we
+		// don't hard-fail block template building.
+		if blockHash.Equal(model.VirtualBlockHash) {
+			pruningPoint, ppErr := pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea)
+			if database.IsNotFoundError(ppErr) {
+				return pm.genesisHash, nil
+			}
+			if ppErr != nil {
+				return nil, ppErr
+			}
+			return pruningPoint, nil
+		}
+
+		log.Infof("ExpectedHeaderPruningPoint failed to retrieve with %s\n", blockHash)
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if ghostdagData.SelectedParent().Equal(pm.genesisHash) {
+		return pm.genesisHash, nil
+	}
+
+	selectedParentHeader, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, ghostdagData.SelectedParent())
+	if database.IsNotFoundError(err) {
+		log.Infof("ExpectedHeaderPruningPoint: block header not found for selected parent %s\n", ghostdagData.SelectedParent())
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	selectedParentPruningPointHeader, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, selectedParentHeader.PruningPoint())
+	if database.IsNotFoundError(err) {
+		return selectedParentHeader.PruningPoint(), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	nextOrCurrentPruningPoint := selectedParentHeader.PruningPoint()
+	pruningPoint, err := pm.pruningStore.PruningPoint(pm.databaseContext, stagingArea)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the block doesn't have the pruning in its selected chain we know for sure that it can't trigger a pruning point
+	// change (we check the selected parent to take care of the case where the block is the virtual which doesn't have reachability data).
+	hasPruningPointInItsSelectedChain, err := pm.dagTopologyManager.IsInSelectedParentChainOf(stagingArea, pruningPoint, ghostdagData.SelectedParent())
+	if err != nil {
+		return nil, err
+	}
+
+	// Note: the pruning point from the POV of the current block is the first block in its chain that is in depth of pm.pruningDepth and
+	// its finality score is greater than the previous pruning point. This is why the diff between finalityScore(selectedParent.blueScore + 1) * finalityInterval
+	// and the current block blue score is less than pm.pruningDepth we can know for sure that this block didn't trigger a pruning point change.
+
+	minRequiredBlueScoreForNextPruningPoint := (pm.finalityScore(selectedParentPruningPointHeader.BlueScore()) + 1) * pm.finalityInterval
+
+	if hasPruningPointInItsSelectedChain &&
+		minRequiredBlueScoreForNextPruningPoint+pm.pruningDepth <= ghostdagData.BlueScore() {
+		var suggestedLowHash *externalapi.DomainHash
+		hasReachabilityData, err := pm.reachabilityDataStore.HasReachabilityData(pm.databaseContext, stagingArea, selectedParentHeader.PruningPoint())
+		if err != nil {
+			return nil, err
+		}
+
+		if hasReachabilityData {
+			// nextPruningPointAndCandidateByBlockHash needs suggestedLowHash to be in the future of the pruning point because
+			// otherwise reachability selected chain data is unreliable.
+			isInFutureOfCurrentPruningPoint, err := pm.dagTopologyManager.IsAncestorOf(stagingArea, pruningPoint, selectedParentHeader.PruningPoint())
+			if err != nil {
+				return nil, err
+			}
+			if isInFutureOfCurrentPruningPoint {
+				suggestedLowHash = selectedParentHeader.PruningPoint()
+			}
+		}
+
+		nextOrCurrentPruningPoint, _, err = pm.nextPruningPointAndCandidateByBlockHash(stagingArea, blockHash, suggestedLowHash)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	isHeaderPruningPoint, err := pm.isPruningPointInPruningDepth(stagingArea, blockHash, nextOrCurrentPruningPoint)
+	if err != nil {
+		return nil, err
+	}
+
+	if isHeaderPruningPoint {
+		return nextOrCurrentPruningPoint, nil
+	}
+
+	pruningPointIndex, err := pm.pruningStore.CurrentPruningPointIndex(pm.databaseContext, stagingArea)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := pruningPointIndex; ; i-- {
+		currentPruningPoint, err := pm.pruningStore.PruningPointByIndex(pm.databaseContext, stagingArea, i)
+		if err != nil {
+			return nil, err
+		}
+
+		isHeaderPruningPoint, err := pm.isPruningPointInPruningDepth(stagingArea, blockHash, currentPruningPoint)
+		if err != nil {
+			return nil, err
+		}
+
+		if isHeaderPruningPoint {
+			return currentPruningPoint, nil
+		}
+
+		if i == 0 {
+			break
+		}
+	}
+
+	return pm.genesisHash, nil
+}
+
+func (pm *pruningManager) isPruningPointInPruningDepth(stagingArea *model.StagingArea, blockHash, pruningPoint *externalapi.DomainHash) (bool, error) {
+	pruningPointHeader, err := pm.blockHeaderStore.BlockHeader(pm.databaseContext, stagingArea, pruningPoint)
+	if err != nil {
+		return false, err
+	}
+
+	blockGHOSTDAGData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, blockHash, false)
+	if database.IsNotFoundError(err) {
+		log.Infof("isPruningPointInPruningDepth failed to retrieve with %s\n", blockHash)
+		return false, err
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return blockGHOSTDAGData.BlueScore() >= pruningPointHeader.BlueScore()+pm.pruningDepth, nil
+}
+
+func (pm *pruningManager) TrustedBlockAssociatedGHOSTDAGDataBlockHashes(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) ([]*externalapi.DomainHash, error) {
+	blockHashes := make([]*externalapi.DomainHash, 0, pm.k[constants.GetBlockVersion()-1])
+	current := blockHash
+	isTrustedData := false
+	for i := externalapi.KType(0); i <= pm.k[constants.GetBlockVersion()-1]; i++ {
+		ghostdagData, err := pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, current, isTrustedData)
+		if database.IsNotFoundError(err) {
+			log.Infof("TrustedBlockAssociatedGHOSTDAGDataBlockHashes failed to retrieve with %s\n", current)
+			return nil, err
+		}
+		isNotFoundError := database.IsNotFoundError(err)
+		if !isNotFoundError && err != nil {
+			return nil, err
+		}
+		if isNotFoundError || ghostdagData.SelectedParent().Equal(model.VirtualGenesisBlockHash) {
+			isTrustedData = true
+			ghostdagData, err = pm.ghostdagDataStore.Get(pm.databaseContext, stagingArea, current, true)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		blockHashes = append(blockHashes, current)
+
+		if ghostdagData.SelectedParent().Equal(pm.genesisHash) {
+			break
+		}
+
+		if current.Equal(pm.genesisHash) {
+			break
+		}
+
+		current = ghostdagData.SelectedParent()
+	}
+
+	return blockHashes, nil
+}

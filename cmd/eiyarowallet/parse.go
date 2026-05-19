@@ -1,0 +1,93 @@
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/libeiyarowallet/serialization"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/consensushashing"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/constants"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/txscript"
+	"github.com/pkg/errors"
+)
+
+var sigBuf [256]byte
+
+func fastHex(dst []byte, src []byte) string {
+	n := hex.Encode(dst, src)
+	return string(dst[:n])
+}
+
+func parse(conf *parseConfig) error {
+	if conf.Transaction == "" && conf.TransactionFile == "" {
+		return errors.Errorf("Either --transaction or --transaction-file is required")
+	}
+	if conf.Transaction != "" && conf.TransactionFile != "" {
+		return errors.Errorf("Both --transaction and --transaction-file cannot be passed at the same time")
+	}
+
+	transactionHex := conf.Transaction
+	if conf.TransactionFile != "" {
+		transactionHexBytes, err := os.ReadFile(conf.TransactionFile)
+		if err != nil {
+			return errors.Wrapf(err, "Could not read hex from %s", conf.TransactionFile)
+		}
+		transactionHex = strings.TrimSpace(string(transactionHexBytes))
+	}
+
+	transactions, err := decodeTransactionsFromHex(transactionHex)
+	if err != nil {
+		return err
+	}
+	for i, transaction := range transactions {
+
+		partiallySignedTransaction, err := serialization.DeserializePartiallySignedTransaction(transaction)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Transaction #%d ID: \t%s\n", i+1, consensushashing.TransactionID(partiallySignedTransaction.Tx))
+		fmt.Println()
+
+		allInputSey := uint64(0)
+		for index, input := range partiallySignedTransaction.Tx.Inputs {
+			partiallySignedInput := partiallySignedTransaction.PartiallySignedInputs[index]
+
+			if conf.Verbose {
+				fmt.Printf("Input %d: \tOutpoint: %s:%d \tAmount: %.2f Eiyaro\n", index, input.PreviousOutpoint.TransactionID,
+					input.PreviousOutpoint.Index, float64(partiallySignedInput.PrevOutput.Value)/float64(constants.SeyPerEY))
+			}
+
+			allInputSey += partiallySignedInput.PrevOutput.Value
+		}
+		if conf.Verbose {
+			fmt.Println()
+		}
+
+		allOutputSey := uint64(0)
+		for index, output := range partiallySignedTransaction.Tx.Outputs {
+			scriptPublicKeyType, scriptPublicKeyAddress, err := txscript.ExtractScriptPubKeyAddress(output.ScriptPublicKey, conf.ActiveNetParams)
+			if err != nil {
+				return err
+			}
+
+			addressString := scriptPublicKeyAddress.EncodeAddress()
+			if scriptPublicKeyType == txscript.NonStandardTy {
+				scriptPublicKeyHex := fastHex(sigBuf[:], output.ScriptPublicKey.Script)
+				addressString = fmt.Sprintf("<Non-standard transaction script public key: %s>", scriptPublicKeyHex)
+			}
+
+			fmt.Printf("Output %d: \tRecipient: %s \tAmount: %.2f Eiyaro\n",
+				index, addressString, float64(output.Value)/float64(constants.SeyPerEY))
+
+			allOutputSey += output.Value
+		}
+		fmt.Println()
+
+		fmt.Printf("Fee:\t%d Sey\n\n", allInputSey-allOutputSey)
+	}
+
+	return nil
+}

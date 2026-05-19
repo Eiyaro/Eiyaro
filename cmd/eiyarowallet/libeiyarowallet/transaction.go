@@ -1,0 +1,330 @@
+package libeiyarowallet
+
+import (
+	"strconv"
+
+	"github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/libeiyarowallet/bip32"
+	"github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/libeiyarowallet/serialization"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/constants"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/subnetworks"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/txscript"
+	"github.com/Eiyaro/Eiyaro/util"
+	"github.com/pkg/errors"
+)
+
+func checkedUint32FromInt(value int) (uint32, error) {
+	parsedValue, err := strconv.ParseUint(strconv.Itoa(value), 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(parsedValue), nil
+}
+
+// Payment contains a recipient payment details
+type Payment struct {
+	Address util.Address
+	Amount  uint64
+}
+
+// UTXO is a type that stores a UTXO and meta data
+// that is needed in order to sign it and create
+// transactions with it.
+type UTXO struct {
+	Outpoint       *externalapi.DomainOutpoint
+	UTXOEntry      externalapi.UTXOEntry
+	DerivationPath string
+}
+
+// CreateUnsignedTransaction creates an unsigned transaction
+func CreateUnsignedTransaction(
+	extendedPublicKeys []string,
+	minimumSignatures uint32,
+	payments []*Payment,
+	selectedUTXOs []*UTXO,
+	payload []byte,
+) ([]byte, error) {
+	sortPublicKeys(extendedPublicKeys)
+	unsignedTransaction, err := createUnsignedTransaction(extendedPublicKeys, minimumSignatures, payments, selectedUTXOs, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	return serialization.SerializePartiallySignedTransaction(unsignedTransaction)
+}
+
+func multiSigRedeemScript(extendedPublicKeys []string, minimumSignatures uint32, path string, ecdsa bool) ([]byte, error) {
+	scriptBuilder := txscript.NewScriptBuilder()
+	scriptBuilder.AddInt64(int64(minimumSignatures))
+	for _, key := range extendedPublicKeys {
+		extendedKey, err := bip32.DeserializeExtendedKey(key)
+		if err != nil {
+			return nil, err
+		}
+
+		derivedKey, err := extendedKey.DeriveFromPath(path)
+		if err != nil {
+			return nil, err
+		}
+
+		publicKey, err := derivedKey.PublicKey()
+		if err != nil {
+			return nil, err
+		}
+
+		var serializedPublicKey []byte
+		if ecdsa {
+			serializedECDSAPublicKey, err := publicKey.Serialize()
+			if err != nil {
+				return nil, err
+			}
+			serializedPublicKey = serializedECDSAPublicKey[:]
+		} else {
+			schnorrPublicKey, err := publicKey.ToSchnorr()
+			if err != nil {
+				return nil, err
+			}
+
+			serializedSchnorrPublicKey, err := schnorrPublicKey.Serialize()
+			if err != nil {
+				return nil, err
+			}
+			serializedPublicKey = serializedSchnorrPublicKey[:]
+		}
+
+		scriptBuilder.AddData(serializedPublicKey)
+	}
+	scriptBuilder.AddInt64(int64(len(extendedPublicKeys)))
+
+	if ecdsa {
+		scriptBuilder.AddOp(txscript.OpCheckMultiSigECDSA)
+	} else {
+		scriptBuilder.AddOp(txscript.OpCheckMultiSig)
+	}
+
+	return scriptBuilder.Script()
+}
+
+func createUnsignedTransaction(
+	extendedPublicKeys []string,
+	minimumSignatures uint32,
+	payments []*Payment,
+	selectedUTXOs []*UTXO,
+	payload []byte,
+) (*serialization.PartiallySignedTransaction, error) {
+	inputs := make([]*externalapi.DomainTransactionInput, len(selectedUTXOs))
+	partiallySignedInputs := make([]*serialization.PartiallySignedInput, len(selectedUTXOs))
+	for i, utxo := range selectedUTXOs {
+		emptyPubKeySignaturePairs := make([]*serialization.PubKeySignaturePair, len(extendedPublicKeys))
+		for i, extendedPublicKey := range extendedPublicKeys {
+			extendedKey, err := bip32.DeserializeExtendedKey(extendedPublicKey)
+			if err != nil {
+				return nil, err
+			}
+
+			derivedKey, err := extendedKey.DeriveFromPath(utxo.DerivationPath)
+			if err != nil {
+				return nil, err
+			}
+
+			emptyPubKeySignaturePairs[i] = &serialization.PubKeySignaturePair{
+				ExtendedPublicKey: derivedKey.String(),
+			}
+		}
+
+		inputs[i] = &externalapi.DomainTransactionInput{PreviousOutpoint: *utxo.Outpoint}
+		partiallySignedInputs[i] = &serialization.PartiallySignedInput{
+			PrevOutput: &externalapi.DomainTransactionOutput{
+				Value:           utxo.UTXOEntry.Amount(),
+				ScriptPublicKey: utxo.UTXOEntry.ScriptPublicKey(),
+			},
+			MinimumSignatures:    minimumSignatures,
+			PubKeySignaturePairs: emptyPubKeySignaturePairs,
+			DerivationPath:       utxo.DerivationPath,
+		}
+	}
+
+	outputs := make([]*externalapi.DomainTransactionOutput, len(payments))
+	for i, payment := range payments {
+		scriptPublicKey, err := txscript.PayToAddrScript(payment.Address)
+		if err != nil {
+			return nil, err
+		}
+
+		outputs[i] = &externalapi.DomainTransactionOutput{
+			Value:           payment.Amount,
+			ScriptPublicKey: scriptPublicKey,
+		}
+	}
+
+	subnetworkID := subnetworks.SubnetworkIDNative
+	if len(payload) > 0 {
+		subnetworkID = subnetworks.SubnetworkIDData
+	}
+
+	domainTransaction := &externalapi.DomainTransaction{
+		Version:      constants.MaxTransactionVersion,
+		Inputs:       inputs,
+		Outputs:      outputs,
+		LockTime:     0,
+		SubnetworkID: subnetworkID,
+		Gas:          0,
+		Payload:      payload,
+	}
+
+	return &serialization.PartiallySignedTransaction{
+		Tx:                    domainTransaction,
+		PartiallySignedInputs: partiallySignedInputs,
+	}, nil
+}
+
+// IsTransactionFullySigned returns whether the transaction is fully signed and ready to broadcast.
+func IsTransactionFullySigned(partiallySignedTransactionBytes []byte) (bool, error) {
+	partiallySignedTransaction, err := serialization.DeserializePartiallySignedTransaction(partiallySignedTransactionBytes)
+	if err != nil {
+		return false, err
+	}
+
+	return isTransactionFullySigned(partiallySignedTransaction), nil
+}
+
+func isTransactionFullySigned(partiallySignedTransaction *serialization.PartiallySignedTransaction) bool {
+	for _, input := range partiallySignedTransaction.PartiallySignedInputs {
+		numSignatures := 0
+		for _, pair := range input.PubKeySignaturePairs {
+			if pair.Signature != nil {
+				numSignatures++
+			}
+		}
+		numSignaturesUint32, err := checkedUint32FromInt(numSignatures)
+		if err != nil {
+			return false
+		}
+		if numSignaturesUint32 < input.MinimumSignatures {
+			return false
+		}
+	}
+	return true
+}
+
+// ExtractTransaction extracts a domain transaction from partially signed transaction after all of the
+// relevant parties have signed it.
+func ExtractTransaction(partiallySignedTransactionBytes []byte, ecdsa bool) (*externalapi.DomainTransaction, error) {
+	partiallySignedTransaction, err := serialization.DeserializePartiallySignedTransaction(partiallySignedTransactionBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return ExtractTransactionDeserialized(partiallySignedTransaction, ecdsa)
+}
+
+// ExtractTransactionDeserialized does the same thing ExtractTransaction does, only receives the PartiallySignedTransaction
+// in an already deserialized format
+func ExtractTransactionDeserialized(partiallySignedTransaction *serialization.PartiallySignedTransaction, ecdsa bool) (
+	*externalapi.DomainTransaction, error,
+) {
+	for i, input := range partiallySignedTransaction.PartiallySignedInputs {
+		isMultisig := len(input.PubKeySignaturePairs) > 1
+		scriptBuilder := txscript.NewScriptBuilder()
+		if isMultisig {
+			signatureCount := 0
+			for _, pair := range input.PubKeySignaturePairs {
+				if pair.Signature != nil {
+					scriptBuilder.AddData(pair.Signature)
+					signatureCount++
+				}
+			}
+			signatureCountUint32, err := checkedUint32FromInt(signatureCount)
+			if err != nil {
+				return nil, err
+			}
+			if signatureCountUint32 < input.MinimumSignatures {
+				return nil, errors.Errorf("missing %d signatures", input.MinimumSignatures-signatureCountUint32)
+			}
+
+			redeemScript, err := partiallySignedInputMultisigRedeemScript(input, ecdsa)
+			if err != nil {
+				return nil, err
+			}
+
+			scriptBuilder.AddData(redeemScript)
+			sigScript, err := scriptBuilder.Script()
+			if err != nil {
+				return nil, err
+			}
+
+			partiallySignedTransaction.Tx.Inputs[i].SignatureScript = sigScript
+		} else {
+			if len(input.PubKeySignaturePairs) > 1 {
+				return nil, errors.Errorf("Cannot sign on P2PK when len(input.PubKeySignaturePairs) > 1")
+			}
+
+			if input.PubKeySignaturePairs[0].Signature == nil {
+				return nil, errors.Errorf("missing signature")
+			}
+
+			prevScriptClass := txscript.GetScriptClass(input.PrevOutput.ScriptPublicKey.Script)
+			switch prevScriptClass {
+			case txscript.PubKeyTy, txscript.PubKeyECDSATy:
+				sigScript, err := txscript.NewScriptBuilder().
+					AddData(input.PubKeySignaturePairs[0].Signature).
+					Script()
+				if err != nil {
+					return nil, err
+				}
+				partiallySignedTransaction.Tx.Inputs[i].SignatureScript = sigScript
+			case txscript.PubKeyHashTy, txscript.PubKeyHashECDSATy:
+				derivedPublicKey, err := bip32.DeserializeExtendedKey(input.PubKeySignaturePairs[0].ExtendedPublicKey)
+				if err != nil {
+					return nil, err
+				}
+
+				publicKey, err := derivedPublicKey.PublicKey()
+				if err != nil {
+					return nil, err
+				}
+
+				var serializedPublicKey []byte
+				switch prevScriptClass {
+				case txscript.PubKeyHashECDSATy:
+					serializedECDSAPublicKey, err := publicKey.Serialize()
+					if err != nil {
+						return nil, err
+					}
+					serializedPublicKey = serializedECDSAPublicKey[:]
+				case txscript.PubKeyHashTy:
+					schnorrPublicKey, err := publicKey.ToSchnorr()
+					if err != nil {
+						return nil, err
+					}
+					serializedSchnorrPublicKey, err := schnorrPublicKey.Serialize()
+					if err != nil {
+						return nil, err
+					}
+					serializedPublicKey = serializedSchnorrPublicKey[:]
+				}
+
+				sigScript, err := txscript.NewScriptBuilder().
+					AddData(input.PubKeySignaturePairs[0].Signature).
+					AddData(serializedPublicKey).
+					Script()
+				if err != nil {
+					return nil, err
+				}
+				partiallySignedTransaction.Tx.Inputs[i].SignatureScript = sigScript
+			default:
+				return nil, errors.Errorf("unsupported prev output script class %s", prevScriptClass)
+			}
+		}
+	}
+	return partiallySignedTransaction.Tx, nil
+}
+
+func partiallySignedInputMultisigRedeemScript(input *serialization.PartiallySignedInput, ecdsa bool) ([]byte, error) {
+	extendedPublicKeys := make([]string, len(input.PubKeySignaturePairs))
+	for i, pair := range input.PubKeySignaturePairs {
+		extendedPublicKeys[i] = pair.ExtendedPublicKey
+	}
+
+	return multiSigRedeemScript(extendedPublicKeys, input.MinimumSignatures, "m", ecdsa)
+}

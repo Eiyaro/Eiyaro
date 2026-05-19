@@ -1,0 +1,910 @@
+﻿package blockrelay
+
+import (
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	peerpkg "github.com/Eiyaro/Eiyaro/app/protocol/peer"
+	"github.com/Eiyaro/Eiyaro/app/protocol/protocolerrors"
+	"github.com/Eiyaro/Eiyaro/domain"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/ruleerrors"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/consensushashing"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/constants"
+	"github.com/Eiyaro/Eiyaro/infrastructure/config"
+	"github.com/Eiyaro/Eiyaro/infrastructure/db/database"
+	"github.com/Eiyaro/Eiyaro/infrastructure/logger"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/addressmanager"
+	"github.com/Eiyaro/Eiyaro/infrastructure/network/netadapter/router"
+	"github.com/pkg/errors"
+)
+
+// IBDContext is the interface for the context needed for the HandleIBD flow.
+type IBDContext interface {
+	Domain() domain.Domain
+	Config() *config.Config
+	OnNewBlock(block *externalapi.DomainBlock) error
+	OnNewBlockTemplate() error
+	OnPruningPointUTXOSetOverride() error
+	IsIBDRunning() bool
+	TrySetIBDRunning(ibdPeer *peerpkg.Peer, isNearlySynced bool) bool
+	UnsetIBDRunning()
+	IsRecoverableError(err error) bool
+	AddressManager() *addressmanager.AddressManager
+}
+
+type handleIBDFlow struct {
+	IBDContext
+	incomingRoute, outgoingRoute *router.Route
+	peer                         *peerpkg.Peer
+	lastRateCheckTime            time.Time
+	consecutiveLowRateCount      int
+	minHeadersPerSecond          float64
+	minBlocksPerSecond           float64
+	slowIBDTicks                 int
+	headersProcessedSinceLast    int64 // Track since last check
+	blocksProcessedSinceLast     int64
+}
+
+// HandleIBD handles IBD
+func HandleIBD(context IBDContext, incomingRoute *router.Route, outgoingRoute *router.Route,
+	peer *peerpkg.Peer,
+) error {
+	flow := &handleIBDFlow{
+		IBDContext:    context,
+		incomingRoute: incomingRoute,
+		outgoingRoute: outgoingRoute,
+		peer:          peer,
+	}
+	return flow.start()
+}
+
+func (flow *handleIBDFlow) start() error {
+	for {
+		// Wait for IBD requests triggered by other flows
+		block, ok := <-flow.peer.IBDRequestChannel()
+		if !ok {
+			return nil
+		}
+		err := flow.runIBDIfNotRunning(block)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (flow *handleIBDFlow) updateBlockVersionFromDAAScore(daaScore uint64) {
+	var blockVersion uint16 = 1
+	for _, powScore := range flow.IBDContext.Config().ActiveNetParams.POWScores {
+		if daaScore >= powScore {
+			blockVersion++
+		}
+	}
+	constants.SetBlockVersion(blockVersion)
+}
+
+func (flow *handleIBDFlow) runIBDIfNotRunning(block *externalapi.DomainBlock) error {
+	isNearlySynced, errNs := flow.Domain().Consensus().IsNearlySynced()
+	if errNs != nil {
+		isNearlySynced = false // If we can't tell, err on the side of caution
+	}
+
+	wasIBDNotRunning := flow.TrySetIBDRunning(flow.peer, isNearlySynced)
+	if !wasIBDNotRunning {
+		log.Debugf("IBD is already running")
+		return nil
+	}
+
+	flow.lastRateCheckTime = time.Now()
+	flow.consecutiveLowRateCount = 0
+	flow.minHeadersPerSecond = float64(flow.Config().MinHeadersPerSecond)
+	flow.minBlocksPerSecond = float64(flow.Config().MinBlocksPerSecond)
+	flow.slowIBDTicks = 3 // 30 seconds when done in 10 second slices
+	flow.headersProcessedSinceLast = 0
+	flow.blocksProcessedSinceLast = 0
+
+	flow.updateBlockVersionFromDAAScore(block.Header.DAAScore())
+	isFinishedSuccessfully := false
+	var err error
+	defer func() {
+		flow.UnsetIBDRunning()
+		err = flow.logIBDFinished(isFinishedSuccessfully, err)
+	}()
+
+	// Determine timeout based on sync status
+	timeout := flow.getIBDTimeout()
+
+	// Channel to receive the IBD result
+	ibdDone := make(chan error, 1)
+
+	// Run IBD in a goroutine
+	go func() {
+		ibdDone <- flow.runIBD(block)
+	}()
+
+	// Wait for IBD to complete or timeout
+	select {
+	case err = <-ibdDone:
+		if err == nil {
+			isFinishedSuccessfully = true
+		}
+	case <-time.After(timeout):
+		if !flow.Config().DisableIBDTimeout || timeout == 0 {
+			log.Warnf("IBD with peer %s timed out after %v, disconnecting and trying to ban the peer depending on --enablebanning setting", flow.peer, timeout)
+			// Disconnect & Remove the peer from address manager to prevent immediate reconnection
+			if err := flow.logIBDFinished(false, protocolerrors.Errorf(false, "IBD timed out")); err != nil {
+				log.Warnf("logIBDFinished returned error: %v", err)
+			}
+			netAddress := flow.peer.Connection().NetAddress()
+			if err := flow.AddressManager().RemoveAddress(netAddress); err != nil {
+				log.Warnf("Failed to remove address %s from address manager: %v", netAddress, err)
+			}
+			flow.peer.Connection().Disconnect()
+			return protocolerrors.Errorf(true, "IBD timed out, nothing to worry, we will find another peer soon!")
+		}
+	}
+
+	return err
+}
+
+func (flow *handleIBDFlow) getIBDTimeout() time.Duration {
+	if !flow.Config().DisableIBDTimeout {
+		isNearlySynced, err := flow.Domain().Consensus().IsNearlySynced()
+		if err != nil {
+			log.Warnf("Failed to check if nearly synced, using default timeout: %v", err)
+			return flow.Config().IBDTimeout
+		}
+
+		if isNearlySynced {
+			// If nearly synced, IBD should be faster, use shorter timeout
+			return flow.Config().NearlySyncedIBDTimeout
+		}
+		// If not nearly synced, allow more time for IBD
+		return flow.Config().IBDTimeout
+	}
+	return 0
+}
+
+func (flow *handleIBDFlow) runIBD(block *externalapi.DomainBlock) error {
+	relayBlockHash := consensushashing.BlockHash(block)
+
+	log.Infof("IBD started with peer %s and relayBlockHash %s", flow.peer, relayBlockHash)
+	log.Infof("Syncing blocks up to %s", relayBlockHash)
+	log.Infof("Trying to find highest known syncer chain block from peer %s with relay hash %s", flow.peer, relayBlockHash)
+
+	syncerHeaderSelectedTipHash, highestKnownSyncerChainHash, err := flow.negotiateMissingSyncerChainSegment()
+	if err != nil {
+		return err
+	}
+
+	shouldDownloadHeadersProof, shouldSync, err := flow.shouldSyncAndShouldDownloadHeadersProof(
+		block, highestKnownSyncerChainHash)
+	if err != nil {
+		return err
+	}
+
+	if !shouldSync {
+		return nil
+	}
+
+	if shouldDownloadHeadersProof {
+		log.Infof("Starting IBD with headers proof")
+		err = flow.ibdWithHeadersProof(syncerHeaderSelectedTipHash, relayBlockHash, block.Header.DAAScore())
+		if err != nil {
+			return err
+		}
+	} else {
+		if flow.Config().NetParams().DisallowDirectBlocksOnTopOfGenesis && !flow.Config().AllowSubmitBlockWhenNotSynced {
+			isGenesisVirtualSelectedParent, err := flow.isGenesisVirtualSelectedParent()
+			if err != nil {
+				return err
+			}
+
+			if isGenesisVirtualSelectedParent {
+				log.Infof("Cannot IBD to %s because it won't change the pruning point. The node needs to IBD "+
+					"to the recent pruning point before normal operation can resume.", relayBlockHash)
+				return nil
+			}
+		}
+
+		err = flow.syncPruningPointFutureHeaders(
+			flow.Domain().Consensus(),
+			syncerHeaderSelectedTipHash, highestKnownSyncerChainHash, relayBlockHash, block.Header.DAAScore())
+		if err != nil {
+			return err
+		}
+	}
+
+	// We start by syncing missing bodies over the syncer selected chain
+	log.Infof("Starting sync missing block bodies")
+	err = flow.syncMissingBlockBodies(syncerHeaderSelectedTipHash)
+	if err != nil {
+		return err
+	}
+	log.Info("Check if relay block hash is in the anticone of the syncer selected tip")
+	relayBlockInfo, err := flow.Domain().Consensus().GetBlockInfo(relayBlockHash)
+	if err != nil {
+		return err
+	}
+	// Relay block might be in the anticone of syncer selected tip, thus
+	// check his chain for missing bodies as well.
+	// Note: this operation can be slightly optimized to avoid the full chain search since relay block
+	// is in syncer virtual mergeset which has bounded size.
+	if relayBlockInfo.BlockStatus == externalapi.StatusHeaderOnly {
+		err = flow.syncMissingBlockBodies(relayBlockHash)
+		if err != nil {
+			return err
+		}
+	}
+
+	log.Infof("Finished syncing blocks up to %s", relayBlockHash)
+
+	return nil
+}
+
+func (flow *handleIBDFlow) negotiateMissingSyncerChainSegment() (*externalapi.DomainHash, *externalapi.DomainHash, error) {
+	/*
+		Algorithm:
+			Request full selected chain block locator from syncer
+			Find the highest block which we know
+			Repeat the locator step over the new range until finding max(past(syncee) \cap chain(syncer))
+	*/
+
+	// Empty hashes indicate that the full chain is queried
+	locatorHashes, err := flow.getSyncerChainBlockLocator(nil, nil, time.Minute*30)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(locatorHashes) == 0 {
+		return nil, nil, protocolerrors.Errorf(true, "Expecting initial syncer chain block locator "+
+			"to contain at least one element")
+	}
+	log.Debugf("IBD chain negotiation with peer %s started and received %d hashes (%s, %s)", flow.peer,
+		len(locatorHashes), locatorHashes[0], locatorHashes[len(locatorHashes)-1])
+	syncerHeaderSelectedTipHash := locatorHashes[0]
+	var highestKnownSyncerChainHash *externalapi.DomainHash
+	chainNegotiationRestartCounter := 0
+	chainNegotiationZoomCounts := 0
+	initialLocatorLen := len(locatorHashes)
+	pruningPoint, err := flow.Domain().Consensus().PruningPoint()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for {
+		var lowestUnknownSyncerChainHash, currentHighestKnownSyncerChainHash *externalapi.DomainHash
+		for i := 0; i < len(locatorHashes); i++ {
+			info, err := flow.Domain().Consensus().GetBlockInfo(locatorHashes[i])
+			if err != nil {
+				return nil, nil, err
+			}
+			if info.Exists {
+				if info.BlockStatus == externalapi.StatusInvalid {
+					return nil, nil, protocolerrors.Errorf(false, "Sent invalid chain block %s", locatorHashes[i])
+				}
+
+				isPruningPointOnSyncerChain, err := flow.Domain().Consensus().IsInSelectedParentChainOf(pruningPoint, locatorHashes[i])
+				if err != nil {
+					log.Errorf("Error checking isPruningPointOnSyncerChain: %s", err)
+				}
+
+				// We're only interested in syncer chain blocks that have our pruning
+				// point in their selected chain. Otherwise, it means one of the following:
+				// 1) We will not switch the virtual selected chain to the syncers chain since it will violate finality
+				//    (hence we can ignore it unless merged by others).
+				// 2) syncerChainHash is actually in the past of our pruning point so there's no
+				//    point in syncing from it.
+				if err == nil && isPruningPointOnSyncerChain {
+					currentHighestKnownSyncerChainHash = locatorHashes[i]
+					break
+				}
+			}
+			lowestUnknownSyncerChainHash = locatorHashes[i]
+		}
+		// No unknown blocks, break. Note this can only happen in the first iteration
+		if lowestUnknownSyncerChainHash == nil {
+			highestKnownSyncerChainHash = currentHighestKnownSyncerChainHash
+			break
+		}
+		// No shared block, break
+		if currentHighestKnownSyncerChainHash == nil {
+			highestKnownSyncerChainHash = nil
+			break
+		}
+		// No point in zooming further
+		if len(locatorHashes) == 1 {
+			highestKnownSyncerChainHash = currentHighestKnownSyncerChainHash
+			break
+		}
+		// Zoom in
+		locatorHashes, err = flow.getSyncerChainBlockLocator(
+			lowestUnknownSyncerChainHash,
+			currentHighestKnownSyncerChainHash, time.Second*10)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(locatorHashes) > 0 {
+			if !locatorHashes[0].Equal(lowestUnknownSyncerChainHash) ||
+				!locatorHashes[len(locatorHashes)-1].Equal(currentHighestKnownSyncerChainHash) {
+				return nil, nil, protocolerrors.Errorf(true, "Expecting the high and low "+
+					"hashes to match the locator bounds")
+			}
+
+			chainNegotiationZoomCounts++
+			log.Debugf("IBD chain negotiation with peer %s zoomed in (%d) and received %d hashes (%s, %s)", flow.peer,
+				chainNegotiationZoomCounts, len(locatorHashes), locatorHashes[0], locatorHashes[len(locatorHashes)-1])
+
+			if len(locatorHashes) == 2 {
+				// We found our search target
+				highestKnownSyncerChainHash = currentHighestKnownSyncerChainHash
+				break
+			}
+
+			if chainNegotiationZoomCounts > initialLocatorLen*2 {
+				// Since the zoom-in always queries two consecutive entries in the previous locator, it is
+				// expected to decrease in size at least every two iterations
+				return nil, nil, protocolerrors.Errorf(true,
+					"IBD chain negotiation: Number of zoom-in steps %d exceeded the upper bound of 2*%d",
+					chainNegotiationZoomCounts, initialLocatorLen)
+			}
+
+		} else { // Empty locator signals a restart due to chain changes
+			chainNegotiationZoomCounts = 0
+			chainNegotiationRestartCounter++
+			if chainNegotiationRestartCounter > 32 {
+				return nil, nil, protocolerrors.Errorf(false,
+					"IBD chain negotiation with syncer %s exceeded restart limit %d", flow.peer, chainNegotiationRestartCounter)
+			}
+			log.Warnf("IBD chain negotiation with syncer %s restarted %d times", flow.peer, chainNegotiationRestartCounter)
+
+			// An empty locator signals that the syncer chain was modified and no longer contains one of
+			// the queried hashes, so we restart the search. We use a shorter timeout here to avoid a timeout attack
+			locatorHashes, err = flow.getSyncerChainBlockLocator(nil, nil, time.Second*10)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(locatorHashes) == 0 {
+				return nil, nil, protocolerrors.Errorf(true, "Expecting initial syncer chain block locator "+
+					"to contain at least one element")
+			}
+			log.Infof("IBD chain negotiation with peer %s restarted (%d) and received %d hashes (%s, %s)", flow.peer,
+				chainNegotiationRestartCounter, len(locatorHashes), locatorHashes[0], locatorHashes[len(locatorHashes)-1])
+
+			initialLocatorLen = len(locatorHashes)
+			// Reset syncer's header selected tip
+			syncerHeaderSelectedTipHash = locatorHashes[0]
+		}
+	}
+
+	log.Infof("Found highest known syncer chain block %s from peer %s",
+		highestKnownSyncerChainHash, flow.peer)
+
+	return syncerHeaderSelectedTipHash, highestKnownSyncerChainHash, nil
+}
+
+func (flow *handleIBDFlow) isGenesisVirtualSelectedParent() (bool, error) {
+	virtualSelectedParent, err := flow.Domain().Consensus().GetVirtualSelectedParent()
+	if err != nil {
+		return false, err
+	}
+
+	return virtualSelectedParent.Equal(flow.Config().NetParams().GenesisHash), nil
+}
+
+func (flow *handleIBDFlow) logIBDFinished(isFinishedSuccessfully bool, err error) error {
+	if !isFinishedSuccessfully {
+		return err
+	}
+	log.Infof("IBD with peer %s finished successfully", flow.peer)
+	return nil
+}
+
+func (flow *handleIBDFlow) getSyncerChainBlockLocator(
+	highHash, lowHash *externalapi.DomainHash, _ time.Duration,
+) ([]*externalapi.DomainHash, error) {
+	requestIbdChainBlockLocatorMessage := appmessage.NewMsgIBDRequestChainBlockLocator(highHash, lowHash)
+	err := flow.outgoingRoute.Enqueue(requestIbdChainBlockLocatorMessage)
+	if err != nil {
+		return nil, err
+	}
+	message, err := flow.incomingRoute.DequeueWithTimeout(flow.Config().IBDDequeueTimeout)
+	if err != nil {
+		return nil, err
+	}
+	switch message := message.(type) {
+	case *appmessage.MsgIBDChainBlockLocator:
+		if len(message.BlockLocatorHashes) > 64 {
+			return nil, protocolerrors.Errorf(true,
+				"Got block locator of size %d>64 while expecting locator to have size "+
+					"which is logarithmic in DAG size (which should never exceed 2^64)",
+				len(message.BlockLocatorHashes))
+		}
+		return message.BlockLocatorHashes, nil
+	default:
+		return nil, protocolerrors.Errorf(true, "received unexpected message type. "+
+			"expected: %s, got: %s", appmessage.CmdIBDChainBlockLocator, message.Command())
+	}
+}
+
+func (flow *handleIBDFlow) syncPruningPointFutureHeaders(
+	consensus externalapi.Consensus,
+	syncerHeaderSelectedTipHash, highestKnownSyncerChainHash, relayBlockHash *externalapi.DomainHash,
+	highBlockDAAScoreHint uint64,
+) error {
+	log.Infof("Downloading headers from %s", flow.peer)
+
+	if highestKnownSyncerChainHash.Equal(syncerHeaderSelectedTipHash) {
+		// No need to get syncer selected tip headers - sync relay past and return
+		return flow.syncMissingRelayPast(consensus, syncerHeaderSelectedTipHash, relayBlockHash)
+	}
+
+	err := flow.sendRequestHeaders(highestKnownSyncerChainHash, syncerHeaderSelectedTipHash)
+	if err != nil {
+		return err
+	}
+
+	highestSharedBlockHeader, err := consensus.GetBlockHeader(highestKnownSyncerChainHash)
+	if err != nil {
+		return err
+	}
+
+	progressReporter := newIBDProgressReporter(highestSharedBlockHeader.DAAScore(), highBlockDAAScoreHint, "block headers")
+
+	for {
+		// Receive next batch of headers (this call blocks)
+		blockHeadersMessage, doneIBD, err := flow.receiveHeaders()
+		if err != nil {
+			return err
+		}
+
+		if doneIBD {
+			// IBD of headers is finished - proceed to sync relay past
+			return flow.syncMissingRelayPast(consensus, syncerHeaderSelectedTipHash, relayBlockHash)
+		}
+
+		if len(blockHeadersMessage.BlockHeaders) == 0 {
+			return protocolerrors.Errorf(true, "Received an empty headers message from peer %s", flow.peer)
+		}
+
+		// Process all headers in this batch
+		for _, header := range blockHeadersMessage.BlockHeaders {
+			err = flow.processHeader(consensus, header)
+			if err != nil {
+				return err
+			}
+			flow.headersProcessedSinceLast++
+			// Periodic rate check (e.g., every 10 seconds) inside loop
+			if time.Since(flow.lastRateCheckTime) >= 10*time.Second {
+				if err := flow.checkPeriodicRate("headers"); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Report progress
+		lastReceivedHeader := blockHeadersMessage.BlockHeaders[len(blockHeadersMessage.BlockHeaders)-1]
+		progressReporter.reportProgress(len(blockHeadersMessage.BlockHeaders), lastReceivedHeader.DAAScore)
+
+		// Ask for the next batch
+		err = flow.outgoingRoute.Enqueue(appmessage.NewMsgRequestNextHeaders())
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (flow *handleIBDFlow) syncMissingRelayPast(consensus externalapi.Consensus, syncerHeaderSelectedTipHash *externalapi.DomainHash, relayBlockHash *externalapi.DomainHash) error {
+	// Finished downloading syncer selected tip blocks,
+	// check if we already have the triggering relayBlockHash
+	// TODO: undo this modification to check if it's still needed
+	// if syncerHeaderSelectedTipHash.Equal(relayBlockHash) {
+	// 	return nil
+	// }
+	relayBlockInfo, err := consensus.GetBlockInfo(relayBlockHash)
+	if err != nil {
+		return err
+	}
+	if !relayBlockInfo.Exists {
+		// Send a special header request for the selected tip anticone. This is expected to
+		// be a small set, as it is bounded to the size of virtual's mergeset.
+
+		err = flow.sendRequestAnticone(syncerHeaderSelectedTipHash, relayBlockHash)
+		if err != nil {
+			return err
+		}
+		anticoneHeadersMessage, anticoneDone, err := flow.receiveHeaders()
+		if err != nil {
+			return err
+		}
+		if anticoneDone {
+			return protocolerrors.Errorf(true,
+				"Expected one anticone header chunk for past(%s) cap anticone(%s) but got zero",
+				relayBlockHash, syncerHeaderSelectedTipHash)
+		}
+		_, anticoneDone, err = flow.receiveHeaders()
+		if err != nil {
+			return err
+		}
+		if !anticoneDone {
+			return protocolerrors.Errorf(true,
+				"Expected only one anticone header chunk for past(%s) cap anticone(%s)",
+				relayBlockHash, syncerHeaderSelectedTipHash)
+		}
+		for _, header := range anticoneHeadersMessage.BlockHeaders {
+			err = flow.processHeader(consensus, header)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// If the relayBlockHash has still not been received, the peer is misbehaving
+	relayBlockInfo, err = consensus.GetBlockInfo(relayBlockHash)
+	if err != nil {
+		return err
+	}
+	if !relayBlockInfo.Exists {
+		return protocolerrors.Errorf(true, "did not receive relayBlockHash block %s from peer %s during block download", relayBlockHash, flow.peer)
+	}
+	return nil
+}
+
+func (flow *handleIBDFlow) sendRequestAnticone(
+	syncerHeaderSelectedTipHash, relayBlockHash *externalapi.DomainHash,
+) error {
+	msgRequestAnticone := appmessage.NewMsgRequestAnticone(syncerHeaderSelectedTipHash, relayBlockHash)
+	return flow.outgoingRoute.Enqueue(msgRequestAnticone)
+}
+
+func (flow *handleIBDFlow) sendRequestHeaders(
+	highestKnownSyncerChainHash, syncerHeaderSelectedTipHash *externalapi.DomainHash,
+) error {
+	msgRequestHeaders := appmessage.NewMsgRequstHeaders(highestKnownSyncerChainHash, syncerHeaderSelectedTipHash)
+	return flow.outgoingRoute.Enqueue(msgRequestHeaders)
+}
+
+func (flow *handleIBDFlow) receiveHeaders() (msgIBDBlock *appmessage.BlockHeadersMessage, doneHeaders bool, err error) {
+	message, err := flow.incomingRoute.DequeueWithTimeout(flow.Config().IBDDequeueTimeout)
+	if err != nil {
+		return nil, false, err
+	}
+	switch message := message.(type) {
+	case *appmessage.BlockHeadersMessage:
+		return message, false, nil
+	case *appmessage.MsgDoneHeaders:
+		return nil, true, nil
+	default:
+		return nil, false,
+			protocolerrors.Errorf(true, "received unexpected message type. "+
+				"expected: %s or %s, got: %s",
+				appmessage.CmdBlockHeaders,
+				appmessage.CmdDoneHeaders,
+				message.Command())
+	}
+}
+
+func (flow *handleIBDFlow) processHeader(consensus externalapi.Consensus, msgBlockHeader *appmessage.MsgBlockHeader) error {
+	header := appmessage.BlockHeaderToDomainBlockHeader(msgBlockHeader)
+	block := &externalapi.DomainBlock{
+		Header:       header,
+		Transactions: nil,
+		PoWHash:      "",
+	}
+	blockHash := consensushashing.BlockHash(block)
+	blockInfo, err := consensus.GetBlockInfo(blockHash)
+	if err != nil {
+		return err
+	}
+	if blockInfo.Exists {
+		log.Debugf("Block header %s is already in the DAG. Skipping...", blockHash)
+		return nil
+	}
+	err = consensus.ValidateAndInsertBlock(block, false, true)
+	if err != nil {
+		if errors.Is(err, ruleerrors.ErrDuplicateBlock) {
+			return nil
+		}
+		log.Errorf("Rejected block header %s from %s during IBD: %+v", blockHash, flow.peer, errors.WithStack(err))
+		return err
+	}
+
+	return nil
+}
+
+func (flow *handleIBDFlow) validatePruningPointFutureHeaderTimestamps() error {
+	headerSelectedTipHash, err := flow.Domain().StagingConsensus().GetHeadersSelectedTip()
+	if err != nil {
+		return err
+	}
+	headerSelectedTipHeader, err := flow.Domain().StagingConsensus().GetBlockHeader(headerSelectedTipHash)
+	if err != nil {
+		return err
+	}
+	headerSelectedTipTimestamp := headerSelectedTipHeader.TimeInMilliseconds()
+
+	currentSelectedTipHash, err := flow.Domain().Consensus().GetHeadersSelectedTip()
+	if err != nil {
+		return err
+	}
+	currentSelectedTipHeader, err := flow.Domain().Consensus().GetBlockHeader(currentSelectedTipHash)
+	if err != nil {
+		return err
+	}
+	currentSelectedTipTimestamp := currentSelectedTipHeader.TimeInMilliseconds()
+
+	if headerSelectedTipTimestamp < currentSelectedTipTimestamp {
+		return protocolerrors.Errorf(false, "the timestamp of the candidate selected "+
+			"tip is smaller than the current selected tip")
+	}
+
+	minTimestampDifferenceInMilliseconds := (10 * time.Minute).Milliseconds()
+	if headerSelectedTipTimestamp-currentSelectedTipTimestamp < minTimestampDifferenceInMilliseconds {
+		return protocolerrors.Errorf(false, "difference between the timestamps of "+
+			"the current pruning point and the candidate pruning point is too small. Aborting IBD...")
+	}
+	return nil
+}
+
+func (flow *handleIBDFlow) receiveAndInsertPruningPointUTXOSet(
+	consensus externalapi.Consensus, pruningPointHash *externalapi.DomainHash,
+) (bool, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "receiveAndInsertPruningPointUTXOSet")
+	defer onEnd()
+
+	receivedChunkCount := 0
+	receivedUTXOCount := 0
+	// Pre-allocate a buffer to hold the domain pairs.
+	// 1000 is the standard chunk size defined in sendPruningPointUTXOSet.
+	// Instead of leaving a mess for the GC to tidy up afterwards
+	domainPairsBuffer := make([]*externalapi.OutpointAndUTXOEntryPair, 0, 1000)
+
+	for {
+		message, err := flow.incomingRoute.DequeueWithTimeout(flow.Config().IBDDequeueTimeout)
+		if err != nil {
+			return false, err
+		}
+
+		switch message := message.(type) {
+		case *appmessage.MsgPruningPointUTXOSetChunk:
+			receivedUTXOCount += len(message.OutpointAndUTXOEntryPairs)
+
+			// Clear the buffer, but keep the backing array allocation
+			domainPairsBuffer = domainPairsBuffer[:0]
+
+			// Use the new helper to populate the buffer
+			domainPairsBuffer = appmessage.AppendOutpointAndUTXOEntryPairsToDomainOutpointAndUTXOEntryPairs(
+				message.OutpointAndUTXOEntryPairs, domainPairsBuffer)
+
+			err := consensus.AppendImportedPruningPointUTXOs(domainPairsBuffer)
+			if err != nil {
+				return false, err
+			}
+
+			receivedChunkCount++
+			if receivedChunkCount%getIBDBatchSize() == 0 {
+				log.Infof("Received %d UTXO set chunks so far, totaling in %d UTXOs",
+					receivedChunkCount, receivedUTXOCount)
+
+				requestNextPruningPointUTXOSetChunkMessage := appmessage.NewMsgRequestNextPruningPointUTXOSetChunk()
+				err := flow.outgoingRoute.Enqueue(requestNextPruningPointUTXOSetChunkMessage)
+				if err != nil {
+					return false, err
+				}
+			}
+
+		case *appmessage.MsgDonePruningPointUTXOSetChunks:
+			log.Infof("Finished receiving the UTXO set. Total UTXOs: %d", receivedUTXOCount)
+			return true, nil
+
+		case *appmessage.MsgUnexpectedPruningPoint:
+			log.Infof("Could not receive the next UTXO chunk because the pruning point %s "+
+				"is no longer the pruning point of peer %s", pruningPointHash, flow.peer)
+			return false, nil
+
+		default:
+			return false, protocolerrors.Errorf(true, "received unexpected message type. "+
+				"expected: %s or %s or %s, got: %s", appmessage.CmdPruningPointUTXOSetChunk,
+				appmessage.CmdDonePruningPointUTXOSetChunks, appmessage.CmdUnexpectedPruningPoint, message.Command(),
+			)
+		}
+	}
+}
+
+func (flow *handleIBDFlow) syncMissingBlockBodies(highHash *externalapi.DomainHash) error {
+	hashes, err := flow.Domain().Consensus().GetMissingBlockBodyHashes(highHash)
+	log.Infof("Found %d missing block bodies to sync.", len(hashes))
+	if err != nil {
+		return err
+	}
+	if len(hashes) == 0 {
+		log.Debugf("No missing block body hashes found.")
+		return nil
+	}
+
+	lowBlockHeader, err := flow.Domain().Consensus().GetBlockHeader(hashes[0])
+	if err != nil {
+		return err
+	}
+	highBlockHeader, err := flow.Domain().Consensus().GetBlockHeader(hashes[len(hashes)-1])
+	if err != nil {
+		return err
+	}
+	progressReporter := newIBDProgressReporter(lowBlockHeader.DAAScore(), highBlockHeader.DAAScore(), "blocks")
+	highestProcessedDAAScore := lowBlockHeader.DAAScore()
+	updateVirtual, err := flow.Domain().Consensus().IsNearlySynced()
+	if err != nil {
+		return err
+	}
+
+	ibdBatchSize := getIBDBatchSize()
+	// Allocate the map once with the maximum capacity needed.
+	// This prevents the map from having to dynamically grow and wait for the damn GC to arrive
+	receivedBlocks := make(map[externalapi.DomainHash]*externalapi.DomainBlock, ibdBatchSize)
+	for offset := 0; offset < len(hashes); offset += ibdBatchSize {
+		var hashesToRequest []*externalapi.DomainHash
+		if offset+ibdBatchSize < len(hashes) {
+			hashesToRequest = hashes[offset : offset+ibdBatchSize]
+		} else {
+			hashesToRequest = hashes[offset:]
+		}
+
+		// Cache to store received blocks for this batch only
+		clear(receivedBlocks) // Re-use is better than re-allocation :)
+
+		// Request blocks
+		err := flow.outgoingRoute.Enqueue(appmessage.NewMsgRequestIBDBlocks(hashesToRequest))
+		if err != nil {
+			return err
+		}
+		// Dequeue all messages for the requested hashes
+		for i := 0; i < len(hashesToRequest); i++ {
+			message, err := flow.incomingRoute.DequeueWithTimeout(flow.Config().IBDDequeueTimeout)
+			if err != nil {
+				return err
+			}
+
+			msgIBDBlock, ok := message.(*appmessage.MsgIBDBlock)
+			if !ok {
+				log.Errorf("Received unexpected message type. expected: %s, got: %s", appmessage.CmdIBDBlock, message.Command())
+				return protocolerrors.Errorf(false, "received unexpected message type. "+
+					"expected: %s, got: %s", appmessage.CmdIBDBlock, message.Command())
+			}
+
+			if msgIBDBlock.MsgBlock == nil {
+				log.Errorf("Received nil MsgBlock in MsgIBDBlock at index %d", i)
+				return protocolerrors.Errorf(false, "received nil MsgBlock in MsgIBDBlock at index %d", i)
+			}
+
+			block := appmessage.MsgBlockToDomainBlock(msgIBDBlock.MsgBlock)
+			if block == nil {
+				log.Errorf("MsgBlockToDomainBlock returned nil at index %d", i)
+				return protocolerrors.Errorf(false, "MsgBlockToDomainBlock returned nil at index %d", i)
+			}
+
+			blockHash := consensushashing.BlockHash(block)
+			if blockHash == nil {
+				log.Errorf("BlockHash returned nil for block at index %d", i)
+				return protocolerrors.Errorf(false, "BlockHash returned nil for block at index %d", i)
+			}
+
+			receivedBlocks[*blockHash] = block
+			log.Debugf("Received block %s and stored in cache", blockHash)
+		}
+
+		// Process blocks in the order of expected hashes
+		for _, expectedHash := range hashesToRequest {
+			block, exists := receivedBlocks[*expectedHash]
+			if !exists {
+				return protocolerrors.Errorf(true, "expected block %s not found in received blocks", expectedHash)
+			}
+
+			err = flow.Domain().Consensus().ValidateAndInsertBlock(block, updateVirtual, false)
+			if err != nil {
+				if errors.Is(err, ruleerrors.ErrDuplicateBlock) {
+					continue
+				}
+				log.Infof("Rejected block %s from %s during IBD: %+v", expectedHash, flow.peer, errors.WithStack(err))
+				continue
+			}
+			err = flow.OnNewBlock(block)
+			if err != nil {
+				return err
+			}
+
+			highestProcessedDAAScore = block.Header.DAAScore()
+			flow.blocksProcessedSinceLast++
+			// Periodic rate check (e.g., every 10 seconds) inside loop
+			if time.Since(flow.lastRateCheckTime) >= 10*time.Second {
+				if err := flow.checkPeriodicRate("blocks"); err != nil {
+					return err
+				}
+			}
+		}
+
+		progressReporter.reportProgress(len(hashesToRequest), highestProcessedDAAScore)
+	}
+
+	if !updateVirtual {
+		err = flow.resolveVirtual(highestProcessedDAAScore)
+		if err != nil {
+			return err
+		}
+	}
+
+	return flow.OnNewBlockTemplate()
+}
+
+func (flow *handleIBDFlow) resolveVirtual(estimatedVirtualDAAScoreTarget uint64) error {
+	err := flow.Domain().Consensus().ResolveVirtual(func(virtualDAAScoreStart uint64, virtualDAAScore uint64) {
+		var percents int
+		if estimatedVirtualDAAScoreTarget <= virtualDAAScoreStart {
+			percents = 100
+		} else {
+			percents = int(float64(virtualDAAScore-virtualDAAScoreStart) / float64(estimatedVirtualDAAScoreTarget-virtualDAAScoreStart) * 100)
+		}
+		if percents < 0 {
+			percents = 0
+		} else if percents > 100 {
+			percents = 100
+		}
+		log.Infof("Resolving virtual. Estimated progress: %d%%", percents)
+	})
+	if err != nil {
+		if database.IsNotFoundError(err) {
+			log.Errorf("Error: Not found: %s", err)
+			return err
+		}
+		return err
+	}
+
+	log.Infof("Resolved virtual")
+	return nil
+}
+
+// NEW: Helper for periodic rate check
+func (flow *handleIBDFlow) checkPeriodicRate(itemType string) error {
+	now := time.Now()
+	elapsed := now.Sub(flow.lastRateCheckTime).Seconds()
+	if elapsed <= 9 {
+		return nil // Avoid division by zero and low artificial first count too....
+	}
+
+	var rate float64
+	var minRate float64
+	if itemType == "headers" {
+		rate = float64(flow.headersProcessedSinceLast) / elapsed
+		minRate = flow.minHeadersPerSecond
+	} else {
+		rate = float64(flow.blocksProcessedSinceLast) / elapsed
+		minRate = flow.minBlocksPerSecond
+	}
+
+	// Only for debug purposes
+	// log.Infof("IBD peer sent %.2f %s/sec , low rate count: %d", rate, itemType, flow.consecutiveLowRateCount)
+	if rate < minRate {
+		flow.consecutiveLowRateCount++
+		log.Warnf("IBD peer sent %.2f %s/sec (below %.2f), low rate count: %d", rate, itemType, minRate, flow.consecutiveLowRateCount)
+		if flow.consecutiveLowRateCount >= flow.slowIBDTicks {
+			log.Warnf("IBD PEER STUCK -  sent low %s rate for %d ticks, DISCONNECTING", itemType, flow.slowIBDTicks)
+			return flow.disconnectPeerDueToLowRate()
+		}
+	} else {
+		flow.consecutiveLowRateCount = 0 // Reset on good rate
+	}
+
+	// Reset for next interval
+	flow.lastRateCheckTime = now
+	flow.headersProcessedSinceLast = 0
+	flow.blocksProcessedSinceLast = 0
+	return nil
+}
+
+// NEW: Helper to disconnect peer (same as before)
+func (flow *handleIBDFlow) disconnectPeerDueToLowRate() error {
+	netAddress := flow.peer.Connection().NetAddress()
+	if err := flow.AddressManager().RemoveAddress(netAddress); err != nil {
+		log.Warnf("Failed to remove address %s from address manager: %v", netAddress, err)
+	}
+	flow.peer.Connection().Disconnect()
+	return protocolerrors.Errorf(true, "Peer disconnected due to consistently low IBD rate")
+}

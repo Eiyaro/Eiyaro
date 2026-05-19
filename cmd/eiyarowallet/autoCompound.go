@@ -1,0 +1,138 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/daemon/client"
+	"github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/daemon/pb"
+	"github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/keys"
+	"github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/libeiyarowallet"
+	"github.com/pkg/errors"
+)
+
+// sentinel error used to indicate a compound attempt hit the daemon rate limit
+var errRateLimited = errors.New("rate limited")
+
+func autoCompound(conf *autoCompoundConfig) error {
+	if conf.CompoundRate < 6 {
+		conf.CompoundRate = 60
+	}
+	tickerSecond := time.Duration(conf.CompoundRate) * time.Second
+	fmt.Printf("Eiyaro Auto-Compounder STARTED -- 1 compound tx every %d seconds\n", int(tickerSecond.Seconds()))
+
+	// === Load keys ===
+	keysFile, err := keys.ReadKeysFile(conf.NetParams(), conf.KeysFile)
+	if err != nil {
+		return errors.Wrap(err, "reading keys file")
+	}
+
+	if len(keysFile.ExtendedPublicKeys) > len(keysFile.EncryptedMnemonics) {
+		return errors.New("multisig wallet detected but not all private keys present")
+	}
+
+	if len(conf.Password) == 0 {
+		conf.Password = keys.GetPassword("Enter wallet password: ")
+	}
+
+	mnemonics, err := keysFile.DecryptMnemonics(conf.Password)
+	if err != nil {
+		return errors.Wrap(err, "wrong password")
+	}
+
+	// === Connect to htnwallet daemon ===
+	daemonClient, tearDown, err := client.Connect(conf.DaemonAddress)
+	if err != nil {
+		return errors.Wrap(err, "connecting to htnwallet daemon")
+	}
+	defer tearDown()
+
+	ticker := time.NewTicker(tickerSecond)
+	defer ticker.Stop()
+
+	if err := compoundOnce(conf, daemonClient, mnemonics, keysFile.ECDSA); err != nil {
+		fmt.Printf("[%s] compound failed: %v\n", time.Now().Format("15:04:05"), err)
+	}
+	for {
+		<-ticker.C
+		if err := compoundOnce(conf, daemonClient, mnemonics, keysFile.ECDSA); err != nil {
+			fmt.Printf("[%s] compound failed: %v\n", time.Now().Format("15:04:05"), err)
+			continue
+		}
+	}
+}
+
+func compoundOnce(
+	conf *autoCompoundConfig,
+	client pb.EiyarowalletdClient,
+	mnemonics []string,
+	ecdsa bool,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), daemonTimeout)
+	defer cancel()
+
+	// 1. Create unsigned tx
+	resp, err := client.CreateUnsignedCompoundTransaction(ctx, &pb.CreateUnsignedCompoundTransactionRequest{
+		From:                     conf.FromAddresses,
+		Address:                  conf.ToAddress,
+		UseExistingChangeAddress: conf.UseExistingChangeAddress,
+		Limit:                    &conf.Limit,
+	})
+	if err != nil {
+		fmt.Printf("[%s] NOTHING TO COMPOUND - Error: %s, backing off for 5m\n", time.Now().Format("15:04:05"), err)
+		time.Sleep(5 * time.Minute)
+		return nil
+	}
+
+	if len(resp.UnsignedTransactions) == 0 {
+		fmt.Printf("[%s] NOTHING TO COMPOUND, backing off for 5m\n", time.Now().Format("15:04:05"))
+		time.Sleep(5 * time.Minute)
+		return nil
+	}
+
+	unsignedTx := resp.UnsignedTransactions[0]
+
+	// 2. Sign
+	signedTx, err := libeiyarowallet.Sign(conf.NetParams(), mnemonics, unsignedTx, ecdsa)
+	if err != nil {
+		return errors.Wrap(err, "signing failed")
+	}
+
+	// 3. Broadcast
+	bctx, bcancel := context.WithTimeout(context.Background(), daemonTimeout)
+	defer bcancel()
+	isHighPriority := false
+
+	bresp, err := client.Broadcast(bctx, &pb.BroadcastRequest{
+		Transactions:   [][]byte{signedTx},
+		AllowOrphan:    false,
+		IsHighPriority: &isHighPriority,
+	})
+	if err != nil {
+		errString := err.Error()
+		// Handle rate limit gracefully
+		switch {
+		case strings.Contains(errString, "Compound transaction rate limit exceeded"):
+			fmt.Printf("[%s] RATE LIMITED, backing off for 30s\n", time.Now().Format("15:04:05"))
+			return errRateLimited
+		case strings.Contains(errString, "already spent by transaction"):
+			fmt.Printf("[%s] COMPOUND INPUTS WENT STALE, refreshing UTXOs and retrying in 5s\n", time.Now().Format("15:04:05"))
+			time.Sleep(5 * time.Second)
+			return nil
+		default:
+			fmt.Printf("[%s] COMPOUND SUBMIT FAILED, backing off for 30s, err: %s\n", time.Now().Format("15:04:05"), err)
+		}
+		time.Sleep(30 * time.Second)
+		return nil
+	}
+
+	// 4. Success
+	for _, txid := range bresp.TxIDs {
+		fmt.Printf("[%s] COMPOUNDED -- explorer.eiyaro.io/txs/%s\n",
+			time.Now().Format("15:04:05"), txid)
+	}
+
+	return nil
+}

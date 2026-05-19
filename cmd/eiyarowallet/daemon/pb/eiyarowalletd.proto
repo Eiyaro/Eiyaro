@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+option go_package = "github.com/Eiyaro/Eiyaro/cmd/eiyarowallet/daemon/pb";
+package eiyarowalletd;
+
+service eiyarowalletd {
+  rpc GetBalance (GetBalanceRequest) returns (GetBalanceResponse) {}
+  rpc GetExternalSpendableUTXOs (GetExternalSpendableUTXOsRequest) returns (GetExternalSpendableUTXOsResponse) {}
+  rpc CreateUnsignedTransactions (CreateUnsignedTransactionsRequest) returns (CreateUnsignedTransactionsResponse) {}
+  rpc ShowAddresses (ShowAddressesRequest) returns (ShowAddressesResponse) {}
+  rpc NewAddress (NewAddressRequest) returns (NewAddressResponse) {}
+  rpc Shutdown (ShutdownRequest) returns (ShutdownResponse) {}
+  rpc Broadcast (BroadcastRequest) returns (BroadcastResponse) {}
+  // Since SendRequest contains a password - this command should only be used on a trusted or secure connection
+  rpc Send(SendRequest) returns (SendResponse) {}
+  // Since SignRequest contains a password - this command should only be used on a trusted or secure connection
+  rpc Sign(SignRequest) returns (SignResponse) {}
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse) {}
+  rpc CreateUnsignedCompoundTransaction (CreateUnsignedCompoundTransactionRequest) returns (CreateUnsignedCompoundTransactionResponse) {}
+}
+
+message GetBalanceRequest {
+}
+
+message GetBalanceResponse {
+  uint64 available = 1;
+  uint64 pending = 2;
+  repeated AddressBalances addressBalances = 3;
+}
+
+message AddressBalances {
+  string address = 1;
+  uint64 available = 2;
+  uint64 pending = 3;
+}
+
+message CreateUnsignedTransactionsRequest {
+  string address = 1;
+  uint64 amount = 2;
+  repeated string from = 3;
+  bool useExistingChangeAddress = 4;
+  bool isSendAll = 5;
+  bytes payload = 6;
+  optional string limit = 7;
+}
+
+message CreateUnsignedTransactionsResponse {
+  repeated bytes unsignedTransactions = 1;
+}
+
+message CreateUnsignedCompoundTransactionRequest {
+  string address = 1;
+  repeated string from = 2;
+  bool useExistingChangeAddress = 3;
+  optional string limit = 4;
+}
+
+message CreateUnsignedCompoundTransactionResponse {
+  repeated bytes unsignedTransactions = 1;
+}
+
+message ShowAddressesRequest {
+  AddressType addressType = 1;
+  bool includeBoth = 2;
+}
+
+message ShowAddressesResponse {
+  repeated string address = 1;
+}
+
+message NewAddressRequest {
+  AddressType addressType = 1;
+}
+
+message NewAddressResponse {
+  // address is the primary address string returned by the daemon.
+  // When addressType is unspecified it defaults to P2PK.
+  string address = 1;
+  // p2pkAddress and p2pkhAddress are returned for single-sig wallets.
+  // For multisig wallets (P2SH), these fields are empty.
+  string p2pkAddress = 2;
+  string p2pkhAddress = 3;
+}
+
+enum AddressType {
+  ADDRESS_TYPE_UNSPECIFIED = 0;
+  ADDRESS_TYPE_P2PKH = 1;
+  ADDRESS_TYPE_P2PK = 2;
+}
+
+message BroadcastRequest {
+  bool isDomain = 1;
+  repeated bytes transactions = 2;
+  bool allowOrphan = 3;
+  optional bool isHighPriority = 4;
+}
+
+message BroadcastResponse {
+  repeated string txIDs = 1;
+}
+
+message ShutdownRequest {
+}
+
+message ShutdownResponse {
+}
+
+message Outpoint {
+  string transactionId = 1;
+  uint32 index = 2;
+}
+
+message UtxosByAddressesEntry {
+  string address = 1;
+  Outpoint outpoint = 2;
+  UtxoEntry utxoEntry = 3;
+}
+
+message ScriptPublicKey {
+  uint32 version = 1;
+  string scriptPublicKey = 2;
+}
+
+message UtxoEntry {
+  uint64 amount = 1;
+  ScriptPublicKey scriptPublicKey = 2;
+  uint64 blockDaaScore = 3;
+  bool isCoinbase = 4;
+}
+
+message GetExternalSpendableUTXOsRequest{
+  string address = 1;
+}
+
+message GetExternalSpendableUTXOsResponse{
+  repeated UtxosByAddressesEntry Entries = 1;
+}
+// Since SendRequest contains a password - this command should only be used on a trusted or secure connection
+message SendRequest{
+  string toAddress = 1;
+  uint64 amount = 2;
+  string password = 3;
+  repeated string from = 4;
+  bool useExistingChangeAddress = 5;
+  bool isSendAll = 6;
+  optional string limit = 7;
+}
+
+message SendResponse{
+  repeated string txIDs = 1;
+  repeated bytes signedTransactions = 2;
+}
+
+// Since SignRequest contains a password - this command should only be used on a trusted or secure connection
+message SignRequest{
+  repeated bytes unsignedTransactions = 1;
+  string password = 2;
+}
+
+message SignResponse{
+  repeated bytes signedTransactions = 1;
+}
+
+message GetVersionRequest{
+}
+
+message GetVersionResponse{
+  string version = 1;
+}

@@ -1,0 +1,79 @@
+package consensusstatestore
+
+import (
+	"github.com/Eiyaro/Eiyaro/domain/consensus/database"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/database/serialization"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/cockroachdb/errors"
+)
+
+var tipsKeyName = []byte("tips")
+
+func (css *consensusStateStore) Tips(stagingArea *model.StagingArea, dbContext model.DBReader) ([]*externalapi.DomainHash, error) {
+	stagingShard := css.stagingShard(stagingArea)
+
+	if stagingShard.tipsStaging != nil {
+		return externalapi.CloneHashes(stagingShard.tipsStaging), nil
+	}
+
+	if css.tipsCache != nil {
+		return externalapi.CloneHashes(css.tipsCache), nil
+	}
+
+	tipsBytes, err := dbContext.Get(css.tipsKey)
+	if errors.Is(err, database.ErrNotFound) {
+		return nil, errors.Wrapf(err, "Tip does not exist in db")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	tips, err := css.deserializeTips(tipsBytes)
+	if err != nil {
+		return nil, err
+	}
+	css.tipsCache = tips
+	return externalapi.CloneHashes(tips), nil
+}
+
+func (css *consensusStateStore) StageTips(stagingArea *model.StagingArea, tipHashes []*externalapi.DomainHash) {
+	stagingShard := css.stagingShard(stagingArea)
+
+	stagingShard.tipsStaging = externalapi.CloneHashes(tipHashes)
+}
+
+func (css *consensusStateStore) serializeTips(tips []*externalapi.DomainHash) ([]byte, error) {
+	dbTips := serialization.TipsToDBTips(tips)
+	return dbTips.MarshalVT()
+}
+
+func (css *consensusStateStore) deserializeTips(tipsBytes []byte) ([]*externalapi.DomainHash,
+	error,
+) {
+	dbTips := &serialization.DbTips{}
+	err := dbTips.UnmarshalVT(tipsBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return serialization.DBTipsToTips(dbTips)
+}
+
+func (csss *consensusStateStagingShard) commitTips(dbTx model.DBTransaction) error {
+	if csss.tipsStaging == nil {
+		return nil
+	}
+
+	tipsBytes, err := csss.store.serializeTips(csss.tipsStaging)
+	if err != nil {
+		return err
+	}
+	err = dbTx.Put(csss.store.tipsKey, tipsBytes)
+	if err != nil {
+		return err
+	}
+	csss.store.tipsCache = csss.tipsStaging
+
+	return nil
+}

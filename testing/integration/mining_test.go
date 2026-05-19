@@ -1,0 +1,44 @@
+package integration
+
+import (
+	"math/rand"
+	"testing"
+	"time"
+
+	"github.com/Eiyaro/Eiyaro/app/appmessage"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/model/externalapi"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/mining"
+	"github.com/Eiyaro/Eiyaro/domain/consensus/utils/pow"
+)
+
+func newMiningRand() *rand.Rand {
+	// #nosec G404 -- mining.SolveBlock requires math/rand and this helper is used only in integration tests.
+	return rand.New(rand.NewSource(time.Now().UnixNano()))
+}
+
+func mineNextBlock(t *testing.T, harness *appHarness) *externalapi.DomainBlock {
+	blockTemplate, err := harness.rpcClient.GetBlockTemplate(harness.miningAddress, "integration")
+	if err != nil {
+		t.Fatalf("Error getting block template: %+v", err)
+	}
+
+	block, err := appmessage.RPCBlockToDomainBlock(blockTemplate.Block, "REAL_MAIN_POW_HASH")
+	if err != nil {
+		t.Fatalf("Error converting block: %s", err)
+	}
+
+	if harness.config.ActiveNetParams.SkipProofOfWork {
+		// PoW validation is disabled for integration tests, so avoid expensive nonce search.
+		_, powHash := pow.NewState(block.Header.ToMutable()).CalculateProofOfWorkValue()
+		block.PoWHash = powHash.String()
+	} else {
+		_, powHash := mining.SolveBlock(block, newMiningRand())
+		block.PoWHash = powHash
+	}
+	_, err = harness.rpcClient.SubmitBlockAlsoIfNonDAA(block, block.PoWHash)
+	if err != nil {
+		t.Fatalf("Error submitting block: %s", err)
+	}
+
+	return block
+}
