@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.25.7-00ADD8.svg?logo=go)](https://go.dev)
-[![Build Status](https://github.com/Hoosat-Oy/Eiyaro/workflows/Tests/badge.svg)](https://github.com/Hoosat-Oy/Eiyaro/actions)
+
 
 **Eiyaro** is a high-performance decentralized blockchain node implementation featuring the innovative **NogoPow** Proof-of-Work algorithm.
 
