@@ -1,4 +1,4 @@
-# Eiyaro
+# Eiyaro (エイヤロ)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.25.7-00ADD8.svg?logo=go)](https://go.dev)
